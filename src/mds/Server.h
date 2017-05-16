@@ -16,6 +16,7 @@
 #define CEPH_MDS_SERVER_H
 
 #include "MDSRank.h"
+#include "Mutation.h"
 
 class OSDMap;
 class PerfCounters;
@@ -28,17 +29,40 @@ class MClientRequest;
 class MClientReply;
 class MDLog;
 
-struct MutationImpl;
-struct MDRequestImpl;
-typedef ceph::shared_ptr<MutationImpl> MutationRef;
-typedef ceph::shared_ptr<MDRequestImpl> MDRequestRef;
-
 enum {
   l_mdss_first = 1000,
   l_mdss_handle_client_request,
   l_mdss_handle_slave_request,
   l_mdss_handle_client_session,
   l_mdss_dispatch_client_request,
+  l_mdss_req_lookuphash,
+  l_mdss_req_lookupino,
+  l_mdss_req_lookupparent,
+  l_mdss_req_lookupname,
+  l_mdss_req_lookup,
+  l_mdss_req_lookupsnap,
+  l_mdss_req_getattr,
+  l_mdss_req_setattr,
+  l_mdss_req_setlayout,
+  l_mdss_req_setdirlayout,
+  l_mdss_req_setxattr,
+  l_mdss_req_rmxattr,
+  l_mdss_req_readdir,
+  l_mdss_req_setfilelock,
+  l_mdss_req_getfilelock,
+  l_mdss_req_create,
+  l_mdss_req_open,
+  l_mdss_req_mknod,
+  l_mdss_req_link,
+  l_mdss_req_unlink,
+  l_mdss_req_rmdir,
+  l_mdss_req_rename,
+  l_mdss_req_mkdir,
+  l_mdss_req_symlink,
+  l_mdss_req_lssnap,
+  l_mdss_req_mksnap,
+  l_mdss_req_rmsnap,
+  l_mdss_req_renamesnap,
   l_mdss_dispatch_slave_request,
   l_mdss_last,
 };
@@ -145,7 +169,7 @@ public:
   CInode* prepare_new_inode(MDRequestRef& mdr, CDir *dir, inodeno_t useino, unsigned mode,
 			    file_layout_t *layout=NULL);
   void journal_allocated_inos(MDRequestRef& mdr, EMetaBlob *blob);
-  void apply_allocated_inos(MDRequestRef& mdr);
+  void apply_allocated_inos(MDRequestRef& mdr, Session *session);
 
   CInode* rdlock_path_pin_ref(MDRequestRef& mdr, int n, set<SimpleLock*>& rdlocks, bool want_auth,
 			      bool no_want_auth=false,
@@ -233,7 +257,7 @@ public:
   void _unlink_local_finish(MDRequestRef& mdr,
 			    CDentry *dn, CDentry *straydn,
 			    version_t);
-  bool _rmdir_prepare_witness(MDRequestRef& mdr, mds_rank_t who, CDentry *dn, CDentry *straydn);
+  bool _rmdir_prepare_witness(MDRequestRef& mdr, mds_rank_t who, vector<CDentry*>& trace, CDentry *straydn);
   void handle_slave_rmdir_prep(MDRequestRef& mdr);
   void _logged_slave_rmdir(MDRequestRef& mdr, CDentry *srcdn, CDentry *straydn);
   void _commit_slave_rmdir(MDRequestRef& mdr, int r);
@@ -257,7 +281,7 @@ public:
 
   // helpers
   bool _rename_prepare_witness(MDRequestRef& mdr, mds_rank_t who, set<mds_rank_t> &witnesse,
-			       CDentry *srcdn, CDentry *destdn, CDentry *straydn);
+			       vector<CDentry*>& srctrace, vector<CDentry*>& dsttrace, CDentry *straydn);
   version_t _rename_prepare_import(MDRequestRef& mdr, CDentry *srcdn, bufferlist *client_map_bl);
   bool _need_force_journal(CInode *diri, bool empty);
   void _rename_prepare(MDRequestRef& mdr,

@@ -6,6 +6,8 @@ set(working_dir ${CMAKE_BINARY_DIR}/include)
 set(header_dir ${working_dir}/tracing)
 file(MAKE_DIRECTORY ${header_dir})
 
+add_custom_target(tracepoint_libraries)
+
 file(GLOB tps "*.tp")
 foreach(tp ${tps})
   get_filename_component(name ${tp} NAME_WE)
@@ -26,14 +28,17 @@ function(add_tracing_library name tracings version)
     get_filename_component(tp ${tp_file} NAME_WE)
     list(APPEND hdrs
       ${header_dir}/${tp}.h)
+    list(APPEND tpfiles ${tp}.c)
   endforeach()
-  add_library(${name} SHARED ${hdrs} ${tp}.c)
+  add_library(${name} SHARED ${hdrs} ${tpfiles})
   target_link_libraries(${name} ${LTTNGUST_LIBRARIES} ${CMAKE_DL_LIBS})
   string(REGEX MATCH "^[0-9]+" soversion ${version})
   set_target_properties(${name} PROPERTIES
     OUTPUT_NAME ${name}
     VERSION ${version}
-    SOVERSION ${soversion})
+    SOVERSION ${soversion}
+    INSTALL_RPATH "")
+  add_dependencies(tracepoint_libraries ${name})
 endfunction()
 
 set(osd_traces oprequest.tp osd.tp pg.tp)
@@ -43,4 +48,8 @@ add_tracing_library(rbd_tp librbd.tp 1.0.0)
 add_tracing_library(os_tp objectstore.tp 1.0.0)
 
 install(TARGETS rados_tp osd_tp rbd_tp os_tp DESTINATION ${CMAKE_INSTALL_LIBDIR})
+if(WITH_LTTNG AND WITH_EVENTTRACE)
+  add_tracing_library(eventtrace_tp eventtrace.tp 1.0.0)
+  install(TARGETS eventtrace_tp DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 

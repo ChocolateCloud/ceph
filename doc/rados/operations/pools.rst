@@ -175,6 +175,13 @@ To delete a pool, execute::
 
 	ceph osd pool delete {pool-name} [{pool-name} --yes-i-really-really-mean-it]
 
+
+To remove a pool the mon_allow_pool_delete flag must be set to true in the Monitor's
+configuration. Otherwise they will refuse to remove a pool.
+
+See `Monitor Configuration`_ for more information.
+
+.. _Monitor Configuration: ../../configuration/mon-config-ref
 	
 If you created your own rulesets and rules for a pool you created,  you should
 consider removing them when you no longer need your pool::
@@ -268,15 +275,6 @@ You may set values for the following keys:
 :Type: Integer
 :Version: ``0.54`` and above
 
-.. _crash_replay_interval:
-
-``crash_replay_interval``
-
-:Description: The number of seconds to allow clients to replay acknowledged, 
-              but uncommitted requests.
-              
-:Type: Integer
-
 .. _pg_num:
 
 ``pg_num``
@@ -302,6 +300,16 @@ You may set values for the following keys:
 
 :Description: The ruleset to use for mapping object placement in the cluster.
 :Type: Integer
+
+.. _allow_ec_overwrites:
+
+``allow_ec_overwrites``
+
+:Description: Whether writes to an erasure coded pool can update part
+              of an object, so cephfs and rbd can use it. See
+              `Erasure Coding with Overwrites`_ for more details.
+:Type: Boolean
+:Version: ``12.2.0`` and above
 
 .. _hashpspool:
 
@@ -468,7 +476,7 @@ You may set values for the following keys:
 :Default: ``20``
 
 
-``hit_set_grade_search_last_n``
+``hit_set_search_last_n``
 
 :Description: Count at most N appearance in hit_sets for temperature calculation
 :Type: Integer
@@ -565,12 +573,6 @@ You may get values for the following keys:
 
 :Type: Integer
 :Version: ``0.54`` and above
-
-``crash_replay_interval``
-
-:Description: see crash_replay_interval_
-              
-:Type: Integer
 
 ``pg_num``
 
@@ -739,3 +741,4 @@ a size of 3).
 .. _Pool, PG and CRUSH Config Reference: ../../configuration/pool-pg-config-ref
 .. _Bloom Filter: http://en.wikipedia.org/wiki/Bloom_filter
 .. _setting the number of placement groups: ../placement-groups#set-the-number-of-placement-groups
+.. _Erasure Coding with Overwrites: ../erasure-code#erasure-coding-with-overwrites

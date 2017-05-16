@@ -17,13 +17,11 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdlib.h>
-#include <gtest/gtest.h>
-#include "global/global_init.h"
-#include "compressor/Compressor.h"
-#include "common/ceph_argparse.h"
-#include "global/global_context.h"
+#include "gtest/gtest.h"
 #include "common/config.h"
+#include "compressor/Compressor.h"
 #include "compressor/CompressionPlugin.h"
+#include "global/global_context.h"
 
 class CompressorTest : public ::testing::Test,
 			public ::testing::WithParamInterface<const char*> {
@@ -53,16 +51,16 @@ public:
     }
     cout << "[plugin " << plugin << " (" << GetParam() << ")]" << std::endl;
   }
-  ~CompressorTest() {
+  ~CompressorTest() override {
     g_conf->set_val("compressor_zlib_isal", old_zlib_isal ? "true" : "false");
     g_ceph_context->_conf->apply_changes(NULL);
   }
 
-  void SetUp() {
+  void SetUp() override {
     compressor = Compressor::create(g_ceph_context, plugin);
     ASSERT_TRUE(compressor);
   }
-  void TearDown() {
+  void TearDown() override {
     compressor.reset();
   }
 };
@@ -324,15 +322,24 @@ INSTANTIATE_TEST_CASE_P(
   Compressor,
   CompressorTest,
   ::testing::Values(
+#ifdef __x86_64__
     "zlib/isal",
+#endif
     "zlib/noisal",
-    "snappy"));
+    "snappy",
+    "zstd"));
+
+#ifdef __x86_64__
 
 TEST(ZlibCompressor, zlib_isal_compatibility)
 {
   g_conf->set_val("compressor_zlib_isal", "true");
   g_ceph_context->_conf->apply_changes(NULL);
   CompressorRef isal = Compressor::create(g_ceph_context, "zlib");
+  if (!isal) {
+    // skip the test if the plugin is not ready
+    return;
+  }
   g_conf->set_val("compressor_zlib_isal", "false");
   g_ceph_context->_conf->apply_changes(NULL);
   CompressorRef zlib = Compressor::create(g_ceph_context, "zlib");
@@ -364,6 +371,7 @@ TEST(ZlibCompressor, zlib_isal_compatibility)
   exp.append(test);
   EXPECT_TRUE(exp.contents_equal(after));
 }
+#endif
 
 TEST(CompressionPlugin, all)
 {
@@ -387,11 +395,17 @@ TEST(CompressionPlugin, all)
   }
 }
 
+#ifdef __x86_64__
+
 TEST(ZlibCompressor, isal_compress_zlib_decompress_random)
 {
   g_conf->set_val("compressor_zlib_isal", "true");
   g_ceph_context->_conf->apply_changes(NULL);
   CompressorRef isal = Compressor::create(g_ceph_context, "zlib");
+  if (!isal) {
+    // skip the test if the plugin is not ready
+    return;
+  }
   g_conf->set_val("compressor_zlib_isal", "false");
   g_ceph_context->_conf->apply_changes(NULL);
   CompressorRef zlib = Compressor::create(g_ceph_context, "zlib");
@@ -424,6 +438,10 @@ TEST(ZlibCompressor, isal_compress_zlib_decompress_walk)
   g_conf->set_val("compressor_zlib_isal", "true");
   g_ceph_context->_conf->apply_changes(NULL);
   CompressorRef isal = Compressor::create(g_ceph_context, "zlib");
+  if (!isal) {
+    // skip the test if the plugin is not ready
+    return;
+  }
   g_conf->set_val("compressor_zlib_isal", "false");
   g_ceph_context->_conf->apply_changes(NULL);
   CompressorRef zlib = Compressor::create(g_ceph_context, "zlib");
@@ -454,19 +472,4 @@ TEST(ZlibCompressor, isal_compress_zlib_decompress_walk)
   }
 }
 
-
-int main(int argc, char **argv) {
-  vector<const char*> args;
-  argv_to_vec(argc, (const char **)argv, args);
-  env_to_vec(args);
-
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
-  common_init_finish(g_ceph_context);
-
-  const char* env = getenv("CEPH_LIB");
-  if (env)
-    g_conf->set_val("plugin_dir", env, false, false);
-
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}
+#endif	// __x86_64__

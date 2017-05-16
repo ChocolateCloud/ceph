@@ -59,7 +59,7 @@ public:
    * @param m The message we want to fast dispatch.
    * @returns True if the message can be fast dispatched; false otherwise.
    */
-  virtual bool ms_can_fast_dispatch(Message *m) const { return false;}
+  virtual bool ms_can_fast_dispatch(const Message *m) const { return false;}
   /**
    * This function determines if a dispatcher is included in the
    * list of fast-dispatch capable Dispatchers.
@@ -73,7 +73,7 @@ public:
    *
    * @param m The Message to fast dispatch.
    */
-  virtual void ms_fast_dispatch(Message *m) { assert(0); }
+  virtual void ms_fast_dispatch(Message *m) { ceph_abort(); }
   /**
    * Let the Dispatcher preview a Message before it is dispatched. This
    * function is called on *every* Message, prior to the fast/regular dispatch

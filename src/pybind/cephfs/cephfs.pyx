@@ -16,9 +16,7 @@ import os
 import sys
 
 # Are we running Python 2.x
-_python2 = sys.hexversion < 0x03000000
-
-if _python2:
+if sys.version_info[0] < 3:
     str_type = basestring
 else:
     str_type = str
@@ -124,6 +122,7 @@ cdef extern from "cephfs/libcephfs.h" nogil:
     int ceph_link(ceph_mount_info *cmount, const char *existing, const char *newname)
     int ceph_unlink(ceph_mount_info *cmount, const char *path)
     int ceph_symlink(ceph_mount_info *cmount, const char *existing, const char *newname)
+    int ceph_readlink(ceph_mount_info *cmount, const char *path, char *buf, int64_t size)
     int ceph_setxattr(ceph_mount_info *cmount, const char *path, const char *name,
                       const void *value, size_t size, int flags)
     int ceph_getxattr(ceph_mount_info *cmount, const char *path, const char *name,
@@ -152,63 +151,85 @@ class Error(Exception):
     pass
 
 
-class PermissionError(Error):
+class OSError(Error):
+    def __init__(self, errno, strerror):
+        self.errno = errno
+        self.strerror = strerror
+
+    def __str__(self):
+        return '[Errno {0}] {1}'.format(self.errno, self.strerror)
+
+
+class PermissionError(OSError):
     pass
 
 
-class ObjectNotFound(Error):
+class ObjectNotFound(OSError):
     pass
 
 
-class NoData(Error):
+class NoData(OSError):
     pass
 
 
-class ObjectExists(Error):
+class ObjectExists(OSError):
     pass
 
 
-class IOError(Error):
+class IOError(OSError):
     pass
 
 
-class NoSpace(Error):
+class NoSpace(OSError):
     pass
 
 
-class InvalidValue(Error):
+class InvalidValue(OSError):
     pass
 
 
-class OperationNotSupported(Error):
-    pass
-
-
-class IncompleteWriteError(Error):
+class OperationNotSupported(OSError):
     pass
 
 
 class LibCephFSStateError(Error):
     pass
 
-class WouldBlock(Error):
+
+class WouldBlock(OSError):
     pass
 
-class OutOfRange(Error):
+
+class OutOfRange(OSError):
     pass
 
-cdef errno_to_exception =  {
-    errno.EPERM      : PermissionError,
-    errno.ENOENT     : ObjectNotFound,
-    errno.EIO        : IOError,
-    errno.ENOSPC     : NoSpace,
-    errno.EEXIST     : ObjectExists,
-    errno.ENODATA    : NoData,
-    errno.EINVAL     : InvalidValue,
-    errno.EOPNOTSUPP : OperationNotSupported,
-    errno.ERANGE     : OutOfRange,
-    errno.EWOULDBLOCK: WouldBlock,
-}
+
+IF UNAME_SYSNAME == "FreeBSD":
+    cdef errno_to_exception =  {
+        errno.EPERM      : PermissionError,
+        errno.ENOENT     : ObjectNotFound,
+        errno.EIO        : IOError,
+        errno.ENOSPC     : NoSpace,
+        errno.EEXIST     : ObjectExists,
+        errno.ENOATTR    : NoData,
+        errno.EINVAL     : InvalidValue,
+        errno.EOPNOTSUPP : OperationNotSupported,
+        errno.ERANGE     : OutOfRange,
+        errno.EWOULDBLOCK: WouldBlock,
+    }
+ELSE:
+    cdef errno_to_exception =  {
+        errno.EPERM      : PermissionError,
+        errno.ENOENT     : ObjectNotFound,
+        errno.EIO        : IOError,
+        errno.ENOSPC     : NoSpace,
+        errno.EEXIST     : ObjectExists,
+        errno.ENODATA    : NoData,
+        errno.EINVAL     : InvalidValue,
+        errno.EOPNOTSUPP : OperationNotSupported,
+        errno.ERANGE     : OutOfRange,
+        errno.EWOULDBLOCK: WouldBlock,
+    }
 
 
 cdef make_ex(ret, msg):
@@ -223,9 +244,9 @@ cdef make_ex(ret, msg):
     """
     ret = abs(ret)
     if ret in errno_to_exception:
-        return errno_to_exception[ret](msg)
+        return errno_to_exception[ret](ret, msg)
     else:
-        return Error(msg + (": error code %d" % ret))
+        return Error(ret, msg + (": error code %d" % ret))
 
 
 class DirEntry(namedtuple('DirEntry',
@@ -324,11 +345,19 @@ cdef class LibCephFS(object):
                                   "CephFS object in state %s." % (self.state))
 
     def __cinit__(self, conf=None, conffile=None, auth_id=None, rados_inst=None):
+        """Create a libcephfs wrapper
+
+        :param conf dict opt: settings overriding the default ones and conffile
+        :param conffile str opt: the path to ceph.conf to override the default settings
+        :auth_id str opt: the id used to authenticate the client entity
+        :rados_inst Rados opt: a rados.Rados instance
+        """
         PyEval_InitThreads()
         self.state = "uninitialized"
         if rados_inst is not None:
             if auth_id is not None or conffile is not None or conf is not None:
-                raise InvalidValue("May not pass RADOS instance as well as other configuration")
+                raise make_ex(errno.EINVAL,
+                              "May not pass RADOS instance as well as other configuration")
 
             self.create_with_rados(rados_inst)
         else:
@@ -346,7 +375,7 @@ cdef class LibCephFS(object):
         if conf is not None and not isinstance(conf, dict):
             raise TypeError("conf must be dict or None")
         cstr(conffile, 'configfile', opt=True)
-        auth_id = cstr(auth_id, 'configfile', opt=True)
+        auth_id = cstr(auth_id, 'auth_id', opt=True)
 
         cdef:
             char* _auth_id = opt_str(auth_id)
@@ -631,16 +660,26 @@ cdef class LibCephFS(object):
             if flags == '':
                 cephfs_flags = os.O_RDONLY
             else:
+                access_flags = 0;
                 for c in flags:
                     if c == 'r':
-                        cephfs_flags |= os.O_RDONLY
+                        access_flags = 1;
                     elif c == 'w':
-                        cephfs_flags |= os.O_WRONLY | os.O_TRUNC | os.O_CREAT
-                    elif c == '+':
-                        cephfs_flags |= os.O_RDWR
+                        access_flags = 2;
+                        cephfs_flags |= os.O_TRUNC | os.O_CREAT
+                    elif access_flags > 0 and c == '+':
+                        access_flags = 3;
                     else:
-                        raise OperationNotSupported(
-                            "open flags doesn't support %s" % c)
+                        raise make_ex(errno.EOPNOTSUPP,
+                                      "open flags doesn't support %s" % c)
+
+                if access_flags == 1:
+                    cephfs_flags |= os.O_RDONLY;
+                elif access_flags == 2:
+                    cephfs_flags |= os.O_WRONLY;
+                else:
+                    cephfs_flags |= os.O_RDWR;
+
         elif isinstance(flags, int):
             cephfs_flags = flags
         else:
@@ -863,6 +902,25 @@ cdef class LibCephFS(object):
             ret = ceph_link(self.cluster, _existing, _newname)
         if ret < 0:
             raise make_ex(ret, "error in link")    
+    
+    def readlink(self, path, size):
+        self.require_state("mounted")
+        path = cstr(path, 'path')
+
+        cdef:
+            char* _path = path
+            int64_t _size = size
+            char *buf = NULL
+
+        try:
+            buf = <char *>realloc_chk(buf, _size)
+            with nogil:
+                ret = ceph_readlink(self.cluster, _path, buf, _size)
+            if ret < 0:
+                raise make_ex(ret, "error in readlink")
+            return buf
+        finally:
+            free(buf)
 
     def unlink(self, path):
         self.require_state("mounted")

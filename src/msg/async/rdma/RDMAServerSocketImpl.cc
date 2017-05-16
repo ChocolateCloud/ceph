@@ -16,15 +16,34 @@
 
 #include "msg/async/net_handler.h"
 #include "RDMAStack.h"
+#include "Device.h"
+#include "RDMAConnTCP.h"
 
 #define dout_subsys ceph_subsys_ms
 #undef dout_prefix
 #define dout_prefix *_dout << " RDMAServerSocketImpl "
 
-int RDMAServerSocketImpl::listen(entity_addr_t &sa, const SocketOptions &opt)
+RDMAServerSocketImpl::RDMAServerSocketImpl(CephContext *cct, Infiniband* i, RDMADispatcher *s, RDMAWorker *w, entity_addr_t& a)
+  : cct(cct), infiniband(i), dispatcher(s), worker(w), sa(a)
+{
+}
+
+RDMAServerConnTCP::RDMAServerConnTCP(CephContext *cct, Infiniband* i, RDMADispatcher *s, RDMAWorker *w, entity_addr_t& a)
+  : RDMAServerSocketImpl(cct, i, s, w, a), net(cct), server_setup_socket(-1)
+{
+  ibdev = infiniband->get_device(cct->_conf->ms_async_rdma_device_name.c_str());
+  ibport = cct->_conf->ms_async_rdma_port_num;
+
+  assert(ibdev);
+  assert(ibport > 0);
+
+  ibdev->init(ibport);
+}
+
+int RDMAServerConnTCP::listen(entity_addr_t &sa, const SocketOptions &opt)
 {
   int rc = 0;
-  server_setup_socket = infiniband->net.create_socket(sa.get_family(), true);
+  server_setup_socket = net.create_socket(sa.get_family(), true);
   if (server_setup_socket < 0) {
     rc = -errno;
     lderr(cct) << __func__ << " failed to create server socket: "
@@ -67,7 +86,7 @@ err:
   return -errno;
 }
 
-int RDMAServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &opt, entity_addr_t *out, Worker *w)
+int RDMAServerConnTCP::accept(ConnectedSocket *sock, const SocketOptions &opt, entity_addr_t *out, Worker *w)
 {
   ldout(cct, 15) << __func__ << dendl;
 
@@ -78,31 +97,38 @@ int RDMAServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &opt
   if (sd < 0) {
     return -errno;
   }
-  ldout(cct, 20) << __func__ << " accepted a new QP, tcp_fd: " << sd << dendl;
 
-  infiniband->net.set_close_on_exec(sd);
-  int r = infiniband->net.set_nonblock(sd);
+  net.set_close_on_exec(sd);
+  int r = net.set_nonblock(sd);
   if (r < 0) {
     ::close(sd);
     return -errno;
   }
 
-  r = infiniband->net.set_socket_options(sd, opt.nodelay, opt.rcbuf_size);
+  r = net.set_socket_options(sd, opt.nodelay, opt.rcbuf_size);
   if (r < 0) {
     ::close(sd);
     return -errno;
   }
-  infiniband->net.set_priority(sd, opt.priority);
 
-  RDMAConnectedSocketImpl* server;
+  assert(NULL != out); //out should not be NULL in accept connection
+
+  out->set_sockaddr((sockaddr*)&ss);
+  net.set_priority(sd, opt.priority, out->get_family());
+
+  RDMAConnectedSocketImpl *server;
   //Worker* w = dispatcher->get_stack()->get_worker();
-  server = new RDMAConnectedSocketImpl(cct, infiniband, dispatcher, dynamic_cast<RDMAWorker*>(w));
-  server->set_accept_fd(sd);
+  RDMAConnTCPInfo conn_info = { sd };
+  server = new RDMAConnectedSocketImpl(cct, infiniband, dispatcher, dynamic_cast<RDMAWorker*>(w), &conn_info);
   ldout(cct, 20) << __func__ << " accepted a new QP, tcp_fd: " << sd << dendl;
   std::unique_ptr<RDMAConnectedSocketImpl> csi(server);
   *sock = ConnectedSocket(std::move(csi));
-  if (out)
-    out->set_sockaddr((sockaddr*)&ss);
 
   return 0;
+}
+
+void RDMAServerConnTCP::abort_accept()
+{
+  if (server_setup_socket >= 0)
+    ::close(server_setup_socket);
 }

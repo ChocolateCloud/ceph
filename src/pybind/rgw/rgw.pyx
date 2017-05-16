@@ -183,11 +183,21 @@ class Error(Exception):
     pass
 
 
-class PermissionError(Error):
+class OSError(Error):
+    """ `OSError` class, derived from `Error` """
+    def __init__(self, errno, strerror):
+        self.errno = errno
+        self.strerror = strerror
+
+    def __str__(self):
+        return '[Errno {0}] {1}'.format(self.errno, self.strerror)
+
+
+class PermissionError(OSError):
     pass
 
 
-class ObjectNotFound(Error):
+class ObjectNotFound(OSError):
     pass
 
 
@@ -199,7 +209,7 @@ class ObjectExists(Error):
     pass
 
 
-class IOError(Error):
+class IOError(OSError):
     pass
 
 
@@ -228,18 +238,32 @@ class WouldBlock(Error):
 class OutOfRange(Error):
     pass
 
-cdef errno_to_exception =  {
-    errno.EPERM      : PermissionError,
-    errno.ENOENT     : ObjectNotFound,
-    errno.EIO        : IOError,
-    errno.ENOSPC     : NoSpace,
-    errno.EEXIST     : ObjectExists,
-    errno.ENODATA    : NoData,
-    errno.EINVAL     : InvalidValue,
-    errno.EOPNOTSUPP : OperationNotSupported,
-    errno.ERANGE     : OutOfRange,
-    errno.EWOULDBLOCK: WouldBlock,
-}
+IF UNAME_SYSNAME == "FreeBSD":
+    cdef errno_to_exception =  {
+        errno.EPERM      : PermissionError,
+        errno.ENOENT     : ObjectNotFound,
+        errno.EIO        : IOError,
+        errno.ENOSPC     : NoSpace,
+        errno.EEXIST     : ObjectExists,
+        errno.ENOATTR    : NoData,
+        errno.EINVAL     : InvalidValue,
+        errno.EOPNOTSUPP : OperationNotSupported,
+        errno.ERANGE     : OutOfRange,
+        errno.EWOULDBLOCK: WouldBlock,
+    }
+ELSE:
+    cdef errno_to_exception =  {
+        errno.EPERM      : PermissionError,
+        errno.ENOENT     : ObjectNotFound,
+        errno.EIO        : IOError,
+        errno.ENOSPC     : NoSpace,
+        errno.EEXIST     : ObjectExists,
+        errno.ENODATA    : NoData,
+        errno.EINVAL     : InvalidValue,
+        errno.EOPNOTSUPP : OperationNotSupported,
+        errno.ERANGE     : OutOfRange,
+        errno.EWOULDBLOCK: WouldBlock,
+    }
 
 
 cdef class FileHandle(object):
@@ -285,7 +309,7 @@ cdef make_ex(ret, msg):
     """
     ret = abs(ret)
     if ret in errno_to_exception:
-        return errno_to_exception[ret](msg)
+        return errno_to_exception[ret](ret, msg)
     else:
         return Error(msg + (": error code %d" % ret))
 

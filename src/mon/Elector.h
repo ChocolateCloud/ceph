@@ -65,7 +65,7 @@ class Elector {
    * Event callback responsible for dealing with an expired election once a
    * timer runs out and fires up.
    */
-  Context *expire_event;
+  Context *expire_event = nullptr;
 
   /**
    * Resets the expire_event timer, by cancelling any existing one and
@@ -131,7 +131,6 @@ class Elector {
    * victory.  Also note each peer's feature set.
    */
   map<int, elector_features_t> acked_me;
-  set<int> classic_mons;
   /**
    * @}
    */
@@ -336,7 +335,6 @@ class Elector {
    * @param m A Monitor instance
    */
   explicit Elector(Monitor *m) : mon(m),
-			expire_event(0),
 			epoch(0),
 			participating(true),
 			electing_me(false),
@@ -416,6 +414,7 @@ class Elector {
    * @post  @p participating is true
    */
   void start_participating();
+
   /**
    * @}
    */

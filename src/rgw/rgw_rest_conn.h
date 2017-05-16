@@ -9,10 +9,10 @@
 #include "common/ceph_json.h"
 #include "common/RefCountedObj.h"
 
+#include <atomic>
 
 class CephContext;
 class RGWRados;
-class RGWGetObjData;
 
 template <class T>
 static int parse_decode_json(CephContext *cct, T& t, bufferlist& bl)
@@ -56,11 +56,15 @@ class RGWRESTConn
   RGWAccessKey key;
   string self_zone_group;
   string remote_id;
-  atomic_t counter;
+  std::atomic<int64_t> counter = { 0 };
 
 public:
 
   RGWRESTConn(CephContext *_cct, RGWRados *store, const string& _remote_id, const list<string>& endpoints);
+  // custom move needed for atomic
+  RGWRESTConn(RGWRESTConn&& other);
+  RGWRESTConn& operator=(RGWRESTConn&& other);
+
   int get_url(string& endpoint);
   string get_url();
   const string& get_self_zonegroup() {
@@ -89,7 +93,7 @@ public:
   int get_obj(const rgw_user& uid, req_info *info /* optional */, rgw_obj& obj,
               const ceph::real_time *mod_ptr, const ceph::real_time *unmod_ptr,
               uint32_t mod_zone_id, uint64_t mod_pg_ver,
-              bool prepend_metadata, bool get_op, bool rgwx_stat,
+              bool prepend_metadata, bool get_op, bool rgwx_stat, bool sync_manifest,
               RGWGetDataCB *cb, RGWRESTStreamRWRequest **req);
   int complete_request(RGWRESTStreamRWRequest *req, string& etag, ceph::real_time *mtime, uint64_t *psize, map<string, string>& attrs);
 
@@ -133,7 +137,7 @@ class RGWStreamIntoBufferlist : public RGWGetDataCB {
   bufferlist& bl;
 public:
   RGWStreamIntoBufferlist(bufferlist& _bl) : bl(_bl) {}
-  int handle_data(bufferlist& inbl, off_t bl_ofs, off_t bl_len) {
+  int handle_data(bufferlist& inbl, off_t bl_ofs, off_t bl_len) override {
     bl.claim_append(inbl);
     return bl_len;
   }

@@ -16,6 +16,9 @@
 
 #include "rgw_coroutine.h"
 
+#include <atomic>
+
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
 struct rgw_http_req_data : public RefCountedObject {
@@ -23,7 +26,7 @@ struct rgw_http_req_data : public RefCountedObject {
   curl_slist *h;
   uint64_t id;
   int ret;
-  atomic_t done;
+  std::atomic<bool> done = { false };
   RGWHTTPClient *client;
   void *user_info;
   bool registered;
@@ -57,12 +60,12 @@ struct rgw_http_req_data : public RefCountedObject {
 
     easy_handle = NULL;
     h = NULL;
-    done.set(1);
+    done = true;
     cond.Signal();
   }
 
   bool is_done() {
-    return done.read() != 0;
+    return done;
   }
 
   int get_retcode() {
@@ -120,7 +123,7 @@ size_t RGWHTTPClient::simple_send_http_data(void * const ptr,
   RGWHTTPClient *client = static_cast<RGWHTTPClient *>(_info);
   int ret = client->send_data(ptr, size * nmemb);
   if (ret < 0) {
-    dout(0) << "WARNING: client->receive_data() returned ret="
+    dout(0) << "WARNING: client->send_data() returned ret="
             << ret << dendl;
   }
 
@@ -226,6 +229,14 @@ static curl_slist *headers_to_slist(param_vec_t& headers)
   return h;
 }
 
+static bool is_upload_request(const char *method)
+{
+  if (method == nullptr) {
+    return false;
+  }
+  return strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0;
+}
+
 /*
  * process a single simple one off request, not going through RGWHTTPManager. Not using
  * req_data.
@@ -260,7 +271,9 @@ int RGWHTTPClient::process(const char *method, const char *url)
   }
   curl_easy_setopt(curl_handle, CURLOPT_READFUNCTION, simple_send_http_data);
   curl_easy_setopt(curl_handle, CURLOPT_READDATA, (void *)this);
-  curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1L); 
+  if (is_upload_request(method)) {
+    curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1L);
+  }
   if (has_send_len) {
     curl_easy_setopt(curl_handle, CURLOPT_INFILESIZE, (void *)send_len); 
   }
@@ -336,7 +349,9 @@ int RGWHTTPClient::init_request(const char *method, const char *url, rgw_http_re
   }
   curl_easy_setopt(easy_handle, CURLOPT_READFUNCTION, send_http_data);
   curl_easy_setopt(easy_handle, CURLOPT_READDATA, (void *)req_data);
-  curl_easy_setopt(easy_handle, CURLOPT_UPLOAD, 1L); 
+  if (is_upload_request(method)) {
+    curl_easy_setopt(easy_handle, CURLOPT_UPLOAD, 1L);
+  }
   if (has_send_len) {
     curl_easy_setopt(easy_handle, CURLOPT_INFILESIZE, (void *)send_len); 
   }
@@ -843,7 +858,7 @@ int RGWHTTPManager::process_requests(bool wait_for_data, bool *done)
  */
 int RGWHTTPManager::complete_requests()
 {
-  bool done;
+  bool done = false;
   int ret;
   do {
     ret = process_requests(true, &done);
@@ -887,14 +902,14 @@ int RGWHTTPManager::set_threaded()
 
 void RGWHTTPManager::stop()
 {
-  if (is_stopped.read()) {
+  if (is_stopped) {
     return;
   }
 
-  is_stopped.set(1);
+  is_stopped = true;
 
   if (is_threaded) {
-    going_down.set(1);
+    going_down = true;
     signal_thread();
     reqs_thread->join();
     delete reqs_thread;
@@ -922,7 +937,7 @@ void *RGWHTTPManager::reqs_thread_entry()
 
   ldout(cct, 20) << __func__ << ": start" << dendl;
 
-  while (!going_down.read()) {
+  while (!going_down) {
     int ret = do_curl_wait(cct, (CURLM *)multi_handle, thread_pipe[0]);
     if (ret < 0) {
       dout(0) << "ERROR: do_curl_wait() returned: " << ret << dendl;

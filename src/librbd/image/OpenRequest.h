@@ -19,8 +19,9 @@ namespace image {
 template <typename ImageCtxT = ImageCtx>
 class OpenRequest {
 public:
-  static OpenRequest *create(ImageCtxT *image_ctx, Context *on_finish) {
-    return new OpenRequest(image_ctx, on_finish);
+  static OpenRequest *create(ImageCtxT *image_ctx, bool skip_open_parent,
+                             Context *on_finish) {
+    return new OpenRequest(image_ctx, skip_open_parent, on_finish);
   }
 
   void send();
@@ -40,6 +41,9 @@ private:
    *                |                               |
    *                v                               |
    *            V2_GET_ID|NAME                      |
+   *                |                               |
+   *                v                               |
+   *            V2_GET_NAME_FROM_TRASH              |
    *                |                               |
    *                v                               |
    *            V2_GET_IMMUTABLE_METADATA           |
@@ -68,9 +72,10 @@ private:
    * @endverbatim
    */
 
-  OpenRequest(ImageCtxT *image_ctx, Context *on_finish);
+  OpenRequest(ImageCtxT *image_ctx, bool skip_open_parent, Context *on_finish);
 
   ImageCtxT *m_image_ctx;
+  bool m_skip_open_parent_image;
   Context *m_on_finish;
 
   bufferlist m_out_bl;
@@ -90,6 +95,9 @@ private:
 
   void send_v2_get_name();
   Context *handle_v2_get_name(int *result);
+
+  void send_v2_get_name_from_trash();
+  Context *handle_v2_get_name_from_trash(int *result);
 
   void send_v2_get_immutable_metadata();
   Context *handle_v2_get_immutable_metadata(int *result);

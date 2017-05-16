@@ -52,6 +52,7 @@
 #define MDS_INO_LOG_OFFSET        (2*MAX_MDS)
 #define MDS_INO_LOG_BACKUP_OFFSET (3*MAX_MDS)
 #define MDS_INO_LOG_POINTER_OFFSET    (4*MAX_MDS)
+#define MDS_INO_PURGE_QUEUE       (5*MAX_MDS)
 
 #define MDS_INO_SYSTEM_BASE       ((6*MAX_MDS) + (MAX_MDS * NUM_STRAY))
 
@@ -72,8 +73,6 @@
 
 typedef int32_t mds_rank_t;
 typedef int32_t fs_cluster_id_t;
-
-
 
 BOOST_STRONG_TYPEDEF(uint64_t, mds_gid_t)
 extern const mds_gid_t MDS_GID_NONE;
@@ -111,11 +110,6 @@ class mds_role_t
   }
 };
 std::ostream& operator<<(std::ostream &out, const mds_role_t &role);
-
-
-extern long g_num_ino, g_num_dir, g_num_dn, g_num_cap;
-extern long g_num_inoa, g_num_dira, g_num_dna, g_num_capa;
-extern long g_num_inos, g_num_dirs, g_num_dns, g_num_caps;
 
 
 // CAPS
@@ -415,28 +409,24 @@ inline bool operator==(const client_writeable_range_t& l,
 
 struct inline_data_t {
 private:
-  bufferlist *blp;
+  std::unique_ptr<bufferlist> blp;
 public:
   version_t version;
 
   void free_data() {
-    delete blp;
-    blp = NULL;
+    blp.reset();
   }
   bufferlist& get_data() {
     if (!blp)
-      blp = new bufferlist;
+      blp.reset(new bufferlist);
     return *blp;
   }
   size_t length() const { return blp ? blp->length() : 0; }
 
-  inline_data_t() : blp(0), version(1) {}
-  inline_data_t(const inline_data_t& o) : blp(0), version(o.version) {
+  inline_data_t() : version(1) {}
+  inline_data_t(const inline_data_t& o) : version(o.version) {
     if (o.blp)
       get_data() = *o.blp;
-  }
-  ~inline_data_t() {
-    free_data();
   }
   inline_data_t& operator=(const inline_data_t& o) {
     version = o.version;
@@ -449,7 +439,7 @@ public:
   bool operator==(const inline_data_t& o) const {
    return length() == o.length() &&
 	  (length() == 0 ||
-	   (*const_cast<bufferlist*>(blp) == *const_cast<bufferlist*>(o.blp)));
+	   (*const_cast<bufferlist*>(blp.get()) == *const_cast<bufferlist*>(o.blp.get())));
   }
   bool operator!=(const inline_data_t& o) const {
     return !(*this == o);
@@ -516,6 +506,8 @@ struct inode_t {
   nest_info_t accounted_rstat; // protected by parent's nestlock
 
   quota_info_t quota;
+
+  mds_rank_t export_pin;
  
   // special stuff
   version_t version;           // auth only
@@ -537,6 +529,7 @@ struct inode_t {
 	      truncate_seq(0), truncate_size(0), truncate_from(0),
 	      truncate_pending(0),
 	      time_warp_seq(0), change_attr(0),
+              export_pin(MDS_RANK_NONE),
 	      version(0), file_data_version(0), xattr_version(0),
 	      last_scrub_version(0), backtrace_version(0) {
     clear_layout();
@@ -1162,7 +1155,7 @@ inline void decode(dirfrag_load_vec_t& c, bufferlist::iterator &p) {
 inline std::ostream& operator<<(std::ostream& out, dirfrag_load_vec_t& dl)
 {
   // ugliness!
-  utime_t now = ceph_clock_now(g_ceph_context);
+  utime_t now = ceph_clock_now();
   DecayRate rate(g_conf->mds_decay_halflife);
   return out << "[" << dl.vec[0].get(now, rate) << "," << dl.vec[1].get(now, rate) 
 	     << " " << dl.meta_load(now, rate)
@@ -1234,7 +1227,7 @@ public:
   DecayCounter count;
 
 public:
-  load_spread_t() : p(0), n(0), count(ceph_clock_now(g_ceph_context))
+  load_spread_t() : p(0), n(0), count(ceph_clock_now())
   {
     for (int i=0; i<MAX; i++)
       last[i] = -1;

@@ -28,6 +28,7 @@
 #include "PGLog.h"
 #include "common/LogClient.h"
 
+#define dout_context cct
 #define dout_subsys ceph_subsys_osd
 #define DOUT_PREFIX_ARGS this
 #undef dout_prefix
@@ -36,60 +37,117 @@ static ostream& _prefix(std::ostream *_dout, PGBackend *pgb) {
   return *_dout << pgb->get_parent()->gen_dbg_prefix();
 }
 
-// -- ObjectModDesc --
-struct RollbackVisitor : public ObjectModDesc::Visitor {
-  const hobject_t &hoid;
-  PGBackend *pg;
-  ObjectStore::Transaction t;
-  RollbackVisitor(
-    const hobject_t &hoid,
-    PGBackend *pg) : hoid(hoid), pg(pg) {}
-  void append(uint64_t old_size) {
-    ObjectStore::Transaction temp;
-    pg->rollback_append(hoid, old_size, &temp);
-    temp.append(t);
-    temp.swap(t);
-  }
-  void setattrs(map<string, boost::optional<bufferlist> > &attrs) {
-    ObjectStore::Transaction temp;
-    pg->rollback_setattrs(hoid, attrs, &temp);
-    temp.append(t);
-    temp.swap(t);
-  }
-  void rmobject(version_t old_version) {
-    ObjectStore::Transaction temp;
-    pg->rollback_stash(hoid, old_version, &temp);
-    temp.append(t);
-    temp.swap(t);
-  }
-  void try_rmobject(version_t old_version) {
-    ObjectStore::Transaction temp;
-    pg->rollback_try_stash(hoid, old_version, &temp);
-    temp.append(t);
-    temp.swap(t);
-  }
-  void create() {
-    ObjectStore::Transaction temp;
-    pg->rollback_create(hoid, &temp);
-    temp.append(t);
-    temp.swap(t);
-  }
-  void update_snaps(set<snapid_t> &snaps) {
-    // pass
-  }
-};
-
 void PGBackend::rollback(
-  const hobject_t &hoid,
-  const ObjectModDesc &desc,
+  const pg_log_entry_t &entry,
   ObjectStore::Transaction *t)
 {
-  assert(desc.can_rollback());
-  RollbackVisitor vis(hoid, this);
-  desc.visit(&vis);
+
+  struct RollbackVisitor : public ObjectModDesc::Visitor {
+    const hobject_t &hoid;
+    PGBackend *pg;
+    ObjectStore::Transaction t;
+    RollbackVisitor(
+      const hobject_t &hoid,
+      PGBackend *pg) : hoid(hoid), pg(pg) {}
+    void append(uint64_t old_size) override {
+      ObjectStore::Transaction temp;
+      pg->rollback_append(hoid, old_size, &temp);
+      temp.append(t);
+      temp.swap(t);
+    }
+    void setattrs(map<string, boost::optional<bufferlist> > &attrs) override {
+      ObjectStore::Transaction temp;
+      pg->rollback_setattrs(hoid, attrs, &temp);
+      temp.append(t);
+      temp.swap(t);
+    }
+    void rmobject(version_t old_version) override {
+      ObjectStore::Transaction temp;
+      pg->rollback_stash(hoid, old_version, &temp);
+      temp.append(t);
+      temp.swap(t);
+    }
+    void try_rmobject(version_t old_version) override {
+      ObjectStore::Transaction temp;
+      pg->rollback_try_stash(hoid, old_version, &temp);
+      temp.append(t);
+      temp.swap(t);
+    }
+    void create() override {
+      ObjectStore::Transaction temp;
+      pg->rollback_create(hoid, &temp);
+      temp.append(t);
+      temp.swap(t);
+    }
+    void update_snaps(const set<snapid_t> &snaps) override {
+      ObjectStore::Transaction temp;
+      pg->get_parent()->pgb_set_object_snap_mapping(hoid, snaps, &temp);
+      temp.append(t);
+      temp.swap(t);
+    }
+    void rollback_extents(
+      version_t gen,
+      const vector<pair<uint64_t, uint64_t> > &extents) override {
+      ObjectStore::Transaction temp;
+      pg->rollback_extents(gen, extents, hoid, &temp);
+      temp.append(t);
+      temp.swap(t);
+    }
+  };
+
+  assert(entry.mod_desc.can_rollback());
+  RollbackVisitor vis(entry.soid, this);
+  entry.mod_desc.visit(&vis);
   t->append(vis.t);
 }
 
+struct Trimmer : public ObjectModDesc::Visitor {
+  const hobject_t &soid;
+  PGBackend *pg;
+  ObjectStore::Transaction *t;
+  Trimmer(
+    const hobject_t &soid,
+    PGBackend *pg,
+    ObjectStore::Transaction *t)
+    : soid(soid), pg(pg), t(t) {}
+  void rmobject(version_t old_version) override {
+    pg->trim_rollback_object(
+      soid,
+      old_version,
+      t);
+  }
+  // try_rmobject defaults to rmobject
+  void rollback_extents(
+    version_t gen,
+    const vector<pair<uint64_t, uint64_t> > &extents) override {
+    pg->trim_rollback_object(
+      soid,
+      gen,
+      t);
+  }
+};
+
+void PGBackend::rollforward(
+  const pg_log_entry_t &entry,
+  ObjectStore::Transaction *t)
+{
+  auto dpp = get_parent()->get_dpp();
+  ldpp_dout(dpp, 20) << __func__ << ": entry=" << entry << dendl;
+  if (!entry.can_rollback())
+    return;
+  Trimmer trimmer(entry.soid, this, t);
+  entry.mod_desc.visit(&trimmer);
+}
+
+void PGBackend::trim(
+  const pg_log_entry_t &entry,
+  ObjectStore::Transaction *t)
+{
+  if (!entry.can_rollback())
+    return;
+  Trimmer trimmer(entry.soid, this, t);
+  entry.mod_desc.visit(&trimmer);
+}
 
 void PGBackend::try_stash(
   const hobject_t &hoid,
@@ -102,11 +160,21 @@ void PGBackend::try_stash(
     ghobject_t(hoid, v, get_parent()->whoami_shard().shard));
 }
 
+void PGBackend::remove(
+  const hobject_t &hoid,
+  ObjectStore::Transaction *t) {
+  assert(!hoid.is_temp());
+  t->remove(
+    coll,
+    ghobject_t(hoid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard));
+  get_parent()->pgb_clear_object_snap_mapping(hoid, t);
+}
+
 void PGBackend::on_change_cleanup(ObjectStore::Transaction *t)
 {
   dout(10) << __func__ << dendl;
   // clear temp
-  for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = temp_contents.begin();
+  for (set<hobject_t>::iterator i = temp_contents.begin();
        i != temp_contents.end();
        ++i) {
     dout(10) << __func__ << ": Removing oid "
@@ -144,7 +212,6 @@ int PGBackend::objects_list_partial(
       ch,
       _next,
       ghobject_t::get_max(),
-      parent->sort_bitwise(),
       max - ls->size(),
       &objects,
       &_next);
@@ -181,7 +248,6 @@ int PGBackend::objects_list_range(
     ch,
     ghobject_t(start, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
     ghobject_t(end, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
-    parent->sort_bitwise(),
     INT_MAX,
     &objects,
     NULL);
@@ -293,16 +359,27 @@ void PGBackend::rollback_try_stash(
     ghobject_t(hoid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard));
 }
 
-void PGBackend::rollback_create(
+void PGBackend::rollback_extents(
+  version_t gen,
+  const vector<pair<uint64_t, uint64_t> > &extents,
   const hobject_t &hoid,
   ObjectStore::Transaction *t) {
-  assert(!hoid.is_temp());
+  auto shard = get_parent()->whoami_shard().shard;
+  for (auto &&extent: extents) {
+    t->clone_range(
+      coll,
+      ghobject_t(hoid, gen, shard),
+      ghobject_t(hoid, ghobject_t::NO_GEN, shard),
+      extent.first,
+      extent.second,
+      extent.first);
+  }
   t->remove(
     coll,
-    ghobject_t(hoid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard));
+    ghobject_t(hoid, gen, shard));
 }
 
-void PGBackend::trim_stashed_object(
+void PGBackend::trim_rollback_object(
   const hobject_t &hoid,
   version_t old_version,
   ObjectStore::Transaction *t) {
@@ -331,7 +408,7 @@ PGBackend *PGBackend::build_pg_backend(
     stringstream ss;
     ceph::ErasureCodePluginRegistry::instance().factory(
       profile.find("plugin")->second,
-      g_conf->erasure_code_dir,
+      cct->_conf->get_val<std::string>("erasure_code_dir"),
       profile,
       &ec_impl,
       &ss);
@@ -346,7 +423,7 @@ PGBackend *PGBackend::build_pg_backend(
       pool.stripe_width);
   }
   default:
-    assert(0);
+    ceph_abort();
     return NULL;
   }
 }
@@ -400,7 +477,7 @@ void PGBackend::be_scan_list(
       o.stat_error = true;
     } else {
       derr << __func__ << " got: " << cpp_strerror(r) << dendl;
-      assert(0);
+      ceph_abort();
     }
   }
 }
@@ -547,7 +624,7 @@ map<pg_shard_t, ScrubMap *>::const_iterator
   for (map<pg_shard_t, ScrubMap *>::const_iterator j = maps.begin();
        j != maps.end();
        ++j) {
-    map<hobject_t, ScrubMap::object, hobject_t::BitwiseComparator>::iterator i =
+    map<hobject_t, ScrubMap::object>::iterator i =
       j->second->objects.find(obj);
     if (i == j->second->objects.end()) {
       continue;
@@ -638,20 +715,20 @@ out:
 void PGBackend::be_compare_scrubmaps(
   const map<pg_shard_t,ScrubMap*> &maps,
   bool repair,
-  map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &missing,
-  map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &inconsistent,
-  map<hobject_t, list<pg_shard_t>, hobject_t::BitwiseComparator> &authoritative,
-  map<hobject_t, pair<uint32_t,uint32_t>, hobject_t::BitwiseComparator> &missing_digest,
+  map<hobject_t, set<pg_shard_t>> &missing,
+  map<hobject_t, set<pg_shard_t>> &inconsistent,
+  map<hobject_t, list<pg_shard_t>> &authoritative,
+  map<hobject_t, pair<uint32_t,uint32_t>> &missing_digest,
   int &shallow_errors, int &deep_errors,
   Scrub::Store *store,
   const spg_t& pgid,
   const vector<int> &acting,
   ostream &errorstream)
 {
-  map<hobject_t,ScrubMap::object, hobject_t::BitwiseComparator>::const_iterator i;
-  map<pg_shard_t, ScrubMap *, hobject_t::BitwiseComparator>::const_iterator j;
-  set<hobject_t, hobject_t::BitwiseComparator> master_set;
-  utime_t now = ceph_clock_now(NULL);
+  map<hobject_t,ScrubMap::object>::const_iterator i;
+  map<pg_shard_t, ScrubMap *>::const_iterator j;
+  set<hobject_t> master_set;
+  utime_t now = ceph_clock_now();
 
   // Construct master set
   for (j = maps.begin(); j != maps.end(); ++j) {
@@ -661,7 +738,7 @@ void PGBackend::be_compare_scrubmaps(
   }
 
   // Check maps against master set and each other
-  for (set<hobject_t, hobject_t::BitwiseComparator>::const_iterator k = master_set.begin();
+  for (set<hobject_t>::const_iterator k = master_set.begin();
        k != master_set.end();
        ++k) {
     object_info_t auth_oi;
@@ -758,9 +835,9 @@ void PGBackend::be_compare_scrubmaps(
 	update = MAYBE;
       }
       if (auth_object.digest_present && auth_object.omap_digest_present &&
-	  g_conf->osd_debug_scrub_chance_rewrite_digest &&
+	  cct->_conf->osd_debug_scrub_chance_rewrite_digest &&
 	  (((unsigned)rand() % 100) >
-	   g_conf->osd_debug_scrub_chance_rewrite_digest)) {
+	   cct->_conf->osd_debug_scrub_chance_rewrite_digest)) {
 	dout(20) << __func__ << " randomly updating digest on " << *k << dendl;
 	update = MAYBE;
       }
@@ -790,13 +867,13 @@ void PGBackend::be_compare_scrubmaps(
       if (update != NO) {
 	utime_t age = now - auth_oi.local_mtime;
 	if (update == FORCE ||
-	    age > g_conf->osd_deep_scrub_update_digest_min_age) {
+	    age > cct->_conf->osd_deep_scrub_update_digest_min_age) {
 	  dout(20) << __func__ << " will update digest on " << *k << dendl;
 	  missing_digest[*k] = make_pair(auth_object.digest,
 					 auth_object.omap_digest);
 	} else {
 	  dout(20) << __func__ << " missing digest but age " << age
-		   << " < " << g_conf->osd_deep_scrub_update_digest_min_age
+		   << " < " << cct->_conf->osd_deep_scrub_update_digest_min_age
 		   << " on " << *k << dendl;
 	}
       }

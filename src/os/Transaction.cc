@@ -219,6 +219,15 @@ void ObjectStore::Transaction::dump(ceph::Formatter *f)
       }
       break;
 
+    case Transaction::OP_COLL_SET_BITS:
+      {
+	coll_t cid = i.get_cid(op->cid);
+	f->dump_string("op_name", "coll_set_bits");
+	f->dump_stream("collection") << cid;
+	f->dump_unsigned("bits", op->split_bits);
+      }
+      break;
+
     case Transaction::OP_RMCOLL:
       {
         coll_t cid = i.get_cid(op->cid);
@@ -415,6 +424,7 @@ void ObjectStore::Transaction::dump(ceph::Formatter *f)
 	f->dump_stream("old_oid") << old_oid;
 	f->dump_stream("new_oid") << new_oid;
       }
+      break;
 	
     case Transaction::OP_SETALLOCHINT:
       {

@@ -95,12 +95,13 @@ struct rgw_bucket_dir_entry_meta {
   string owner_display_name;
   string content_type;
   uint64_t accounted_size;
+  string user_data;
 
   rgw_bucket_dir_entry_meta() :
   category(0), size(0), accounted_size(0) { }
 
   void encode(bufferlist &bl) const {
-    ENCODE_START(4, 3, bl);
+    ENCODE_START(5, 3, bl);
     ::encode(category, bl);
     ::encode(size, bl);
     ::encode(mtime, bl);
@@ -109,10 +110,11 @@ struct rgw_bucket_dir_entry_meta {
     ::encode(owner_display_name, bl);
     ::encode(content_type, bl);
     ::encode(accounted_size, bl);
+    ::encode(user_data, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator &bl) {
-    DECODE_START_LEGACY_COMPAT_LEN(4, 3, 3, bl);
+    DECODE_START_LEGACY_COMPAT_LEN(5, 3, 3, bl);
     ::decode(category, bl);
     ::decode(size, bl);
     ::decode(mtime, bl);
@@ -125,6 +127,8 @@ struct rgw_bucket_dir_entry_meta {
       ::decode(accounted_size, bl);
     else
       accounted_size = size;
+    if (struct_v >= 5)
+      ::decode(user_data, bl);
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
@@ -239,6 +243,10 @@ struct cls_rgw_obj_key {
   cls_rgw_obj_key(const string &_name) : name(_name) {}
   cls_rgw_obj_key(const string& n, const string& i) : name(n), instance(i) {}
 
+  void set(const string& _name) {
+    name = _name;
+  }
+
   bool operator==(const cls_rgw_obj_key& k) const {
     return (name.compare(k.name) == 0) &&
            (instance.compare(k.instance) == 0);
@@ -249,6 +257,12 @@ struct cls_rgw_obj_key {
       r = instance.compare(k.instance);
     }
     return (r < 0);
+  }
+  bool operator<=(const cls_rgw_obj_key& k) const {
+    return !(k < *this);
+  }
+  bool empty() {
+    return name.empty();
   }
   void encode(bufferlist &bl) const {
     ENCODE_START(1, 1, bl);
@@ -872,7 +886,7 @@ struct cls_rgw_obj_chain {
 
   cls_rgw_obj_chain() {}
 
-  void push_obj(string& pool, cls_rgw_obj_key& key, string& loc) {
+  void push_obj(const string& pool, const cls_rgw_obj_key& key, const string& loc) {
     cls_rgw_obj obj;
     obj.pool = pool;
     obj.key = key;
@@ -903,6 +917,10 @@ struct cls_rgw_obj_chain {
   }
   static void generate_test_instances(list<cls_rgw_obj_chain*>& ls) {
     ls.push_back(new cls_rgw_obj_chain);
+  }
+
+  bool empty() {
+    return objs.empty();
   }
 };
 WRITE_CLASS_ENCODER(cls_rgw_obj_chain)

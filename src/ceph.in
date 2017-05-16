@@ -38,6 +38,15 @@ FLAG_NOFORWARD  = (1 << 0)
 FLAG_OBSOLETE   = (1 << 1)
 FLAG_DEPRECATED = (1 << 2)
 
+# priorities from src/common/perf_counters.h
+PRIO_CRITICAL = 10
+PRIO_INTERESTING = 8
+PRIO_USEFUL = 5
+PRIO_UNINTERESTING = 2
+PRIO_DEBUGONLY = 0
+
+PRIO_DEFAULT = PRIO_USEFUL
+
 # Make life easier on developers:
 # If in src/, and .libs and pybind exist here, assume we're running
 # from a Ceph source dir and tweak PYTHONPATH and LD_LIBRARY_PATH
@@ -257,6 +266,26 @@ def do_basic_help(parser, args):
     """
     hdr('General usage:')
     parser.print_help()
+    print_locally_handled_command_help()
+
+def print_locally_handled_command_help():
+    hdr("Local commands:")
+    print("""
+ping <mon.id>           Send simple presence/life test to a mon
+                        <mon.id> may be 'mon.*' for all mons
+daemon {type.id|path} <cmd>
+                        Same as --admin-daemon, but auto-find admin socket
+daemonperf {type.id | path} [stat-pats] [priority] [<interval>] [<count>]
+daemonperf {type.id | path} list|ls [stat-pats] [priority]
+                        Get selected perf stats from daemon/admin socket
+                        Optional shell-glob comma-delim match string stat-pats
+                        Optional selection priority (can abbreviate name):
+                         critical, interesting, useful, noninteresting, debug
+                        List shows a table of all available stats
+                        Run <count> times (default forever),
+                         once per <interval> seconds (default 1)
+    """, file=sys.stdout)
+
 
 def do_extended_help(parser, args):
     def help_for_sigs(sigs, partial=None):
@@ -342,7 +371,9 @@ def format_help(cmddict, partial=None):
 
         if not cmd['help']:
             continue
-        if cmd['flags'] is not None and ((cmd['flags'] & (FLAG_OBSOLETE | FLAG_DEPRECATED)) != 0):
+        flags = cmd.get('flags')
+        if (flags is not None and
+            (flags & (FLAG_OBSOLETE | FLAG_DEPRECATED)) != 0):
             continue
         concise = concise_sig(cmd['sig'])
         if partial and not concise.startswith(partial):
@@ -456,7 +487,7 @@ def new_style_command(parsed_args, cmdargs, target, sigdict, inbuf, verbose):
                     if parsed_args.output_format:
                         valid_dict['format'] = parsed_args.output_format
                     if verbose:
-                        print("Submitting command ", valid_dict, file=sys.stderr)
+                        print("Submitting command: ", valid_dict, file=sys.stderr)
                     ret, outbuf, outs = json_command(cluster_handle,
                                                      target=target,
                                                      argdict=valid_dict)
@@ -472,7 +503,7 @@ def new_style_command(parsed_args, cmdargs, target, sigdict, inbuf, verbose):
                     print("Invalid command", file=sys.stderr)
 
     if verbose:
-        print("Submitting command ", valid_dict, file=sys.stderr)
+        print("Submitting command: ", valid_dict, file=sys.stderr)
     return json_command(cluster_handle, target=target, argdict=valid_dict,
                         inbuf=inbuf)
 
@@ -539,10 +570,141 @@ def ping_monitor(cluster_handle, name, timeout):
         run_in_thread(cluster_handle.connect, timeout=timeout)
         for m in monids() :
             s = run_in_thread(cluster_handle.ping_monitor, m)
-            print("mon.{0}".format(m) + '\n' + s)
+            if s is None:
+                print("mon.{0}".format(m) + '\n' + "Error connecting to monitor.")
+            else:
+                print("mon.{0}".format(m) + '\n' + s)
     else :
             s = run_in_thread(cluster_handle.ping_monitor, mon_id)
             print(s)
+    return 0
+
+
+def maybe_daemon_command(parsed_args, childargs):
+    """
+    Check if --admin-socket, daemon, or daemonperf command
+    if it is, returns (boolean handled, return code if handled == True)
+    """
+
+    daemon_perf = False
+    sockpath = None
+    if parsed_args.admin_socket:
+        sockpath = parsed_args.admin_socket
+    elif len(childargs) > 0 and childargs[0] in ["daemon", "daemonperf"]:
+        daemon_perf = (childargs[0] == "daemonperf")
+        # Treat "daemon <path>" or "daemon <name>" like --admin_daemon <path>
+        # Handle "daemonperf <path>" the same but requires no trailing args
+        require_args = 2 if daemon_perf else 3
+        if len(childargs) >= require_args:
+            if childargs[1].find('/') >= 0:
+                sockpath = childargs[1]
+            else:
+                # try resolve daemon name
+                try:
+                    sockpath = ceph_conf(parsed_args, 'admin_socket',
+                                         childargs[1])
+                except Exception as e:
+                    print('Can\'t get admin socket path: ' + str(e), file=sys.stderr)
+                    return True, errno.EINVAL
+            # for both:
+            childargs = childargs[2:]
+        else:
+            print('{0} requires at least {1} arguments'.format(childargs[0], require_args), 
+                file=sys.stderr) 
+            return True, errno.EINVAL
+
+    if sockpath and daemon_perf:
+        return True, daemonperf(childargs, sockpath)
+    elif sockpath:
+        try:
+            raw_write(admin_socket(sockpath, childargs, parsed_args.output_format))
+        except Exception as e:
+            print('admin_socket: {0}'.format(e), file=sys.stderr)
+            return True, errno.EINVAL
+        return True, 0
+
+    return False, 0
+
+
+def isnum(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+def daemonperf(childargs, sockpath):
+    """
+    Handle daemonperf command; returns errno or 0
+
+    daemonperf <daemon> [priority string] [statpats] [interval] [count]
+    daemonperf <daemon> list|ls [statpats]
+    """
+
+    interval = 1
+    count = None
+    statpats = None
+    priority = None
+    do_list = False
+
+    def prio_from_name(arg):
+
+        PRIOMAP = {
+            'critical': PRIO_CRITICAL,
+            'interesting': PRIO_INTERESTING,
+            'useful': PRIO_USEFUL,
+            'uninteresting': PRIO_UNINTERESTING,
+            'debugonly': PRIO_DEBUGONLY,
+        }
+
+        if arg in PRIOMAP:
+            return PRIOMAP[arg]
+        # allow abbreviation
+        for name, val in PRIOMAP.items():
+            if name.startswith(arg):
+                return val
+        return None
+
+    # consume and analyze non-numeric args
+    while len(childargs) and not isnum(childargs[0]):
+        arg = childargs.pop(0)
+        # 'list'?
+        if arg in ['list', 'ls']:
+            do_list = True;
+            continue
+        # prio?
+        prio = prio_from_name(arg)
+        if prio is not None:
+            priority = prio
+            continue
+        # statpats
+        statpats = arg.split(',')
+
+    if priority is None:
+        priority = PRIO_DEFAULT
+
+    if len(childargs) > 0:
+        try:
+            interval = float(childargs.pop(0))
+            if interval < 0:
+                raise ValueError
+        except ValueError:
+            print('daemonperf: interval should be a positive number', file=sys.stderr)
+            return errno.EINVAL
+
+    if len(childargs) > 0:
+        arg = childargs.pop(0)
+        if (not isnum(arg)) or (int(arg) < 0):
+            print('daemonperf: count should be a positive integer', file=sys.stderr)
+            return errno.EINVAL
+        count = int(arg)
+
+    watcher = DaemonWatcher(sockpath, statpats, priority)
+    if do_list:
+        watcher.list()
+    else:
+        watcher.run(interval, count)
+
     return 0
 
 ###
@@ -590,59 +752,9 @@ def main():
 
     format = parsed_args.output_format
 
-    daemon_perf = False
-    sockpath = None
-    if parsed_args.admin_socket:
-        sockpath = parsed_args.admin_socket
-    elif len(childargs) > 0 and childargs[0] in ["daemon", "daemonperf"]:
-        daemon_perf = (childargs[0] == "daemonperf")
-        # Treat "daemon <path>" or "daemon <name>" like --admin_daemon <path>
-        # Handle "daemonperf <path>" the same but requires no trailing args
-        require_args = 2 if daemon_perf else 3
-        if len(childargs) >= require_args:
-            if childargs[1].find('/') >= 0:
-                sockpath = childargs[1]
-            else:
-                # try resolve daemon name
-                try:
-                    sockpath = ceph_conf(parsed_args, 'admin_socket',
-                                         childargs[1])
-                except Exception as e:
-                    print('Can\'t get admin socket path: ' + str(e), file=sys.stderr)
-                    return errno.EINVAL
-            # for both:
-            childargs = childargs[2:]
-        else:
-            print('{0} requires at least {1} arguments'.format(childargs[0], require_args), 
-                file=sys.stderr) 
-            return errno.EINVAL
-
-    if sockpath and daemon_perf:
-        interval = 1
-        count = None
-        if len(childargs) > 0:
-            try:
-                interval = float(childargs[0])
-                if interval < 0:
-                    raise ValueError
-            except ValueError:
-                print('daemonperf: interval should be a positive number', file=sys.stderr)
-                return errno.EINVAL
-        if len(childargs) > 1:
-            if not childargs[1].isdigit():
-                print('daemonperf: count should be a positive integer', file=sys.stderr)
-                return errno.EINVAL
-            count = int(childargs[1])
-        DaemonWatcher(sockpath).run(interval, count)
-        return 0
-    elif sockpath:
-        try:
-            raw_write(admin_socket(sockpath, childargs, format))
-        except Exception as e:
-            print('admin_socket: {0}'.format(e))
-            print('admin_socket: {0}'.format(e), file=sys.stderr)
-            return errno.EINVAL
-        return 0
+    done, ret = maybe_daemon_command(parsed_args, childargs)
+    if done:
+        return ret
 
     timeout = None
     if parsed_args.cluster_timeout:
@@ -685,7 +797,7 @@ def main():
                                        conffile=conffile)
         retargs = run_in_thread(cluster_handle.conf_parse_argv, childargs)
     except rados.Error as e:
-        print('Error initializing cluster client: {0}'.format(repr(e)), file=sys.stderr)
+        print('Error initializing cluster client: {0!r}'.format(e), file=sys.stderr)
         return 1
 
     childargs = retargs
@@ -730,10 +842,10 @@ def main():
         print('Cluster connection aborted', file=sys.stderr)
         return 1
     except rados.PermissionDeniedError as e:
-        print('Error connecting to cluster: {0}'.format(e.__class__.__name__), file=sys.stderr)
+        print(str(e), file=sys.stderr)
         return errno.EACCES
     except Exception as e:
-        print('Error connecting to cluster: {0}'.format(e.__class__.__name__), file=sys.stderr)
+        print(str(e), file=sys.stderr)
         return 1
 
     if parsed_args.help:

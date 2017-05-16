@@ -14,22 +14,19 @@
 
 #ifndef _CEPH_INCLUDE_MEMPOOL_H
 #define _CEPH_INCLUDE_MEMPOOL_H
-#include <iostream>
-#include <fstream>
 
 #include <cstddef>
 #include <map>
 #include <unordered_map>
 #include <set>
 #include <vector>
-#include <assert.h>
 #include <list>
 #include <mutex>
 #include <atomic>
-#include <climits>
 #include <typeinfo>
 
 #include <common/Formatter.h>
+#include "include/assert.h"
 
 
 /*
@@ -100,7 +97,7 @@ BlueStore::Onode, we need to do
   MEMPOOL_DEFINE_OBJECT_FACTORY(BlueStore::Onode, bluestore_onode,
                                 bluestore_meta);
 
-(This is just because we need to name some static varables and we
+(This is just because we need to name some static variables and we
 can't use :: in a variable name.)
 
 In order to use the STL containers, simply use the namespaced variant
@@ -120,7 +117,7 @@ This will dump information about *all* memory pools.  When debug mode
 is enabled, the runtime complexity of dump is O(num_shards *
 num_types).  When debug name is disabled it is O(num_shards).
 
-You can also interogate a specific pool programatically with
+You can also interrogate a specific pool programmatically with
 
   size_t bytes = mempool::unittest_2::allocated_bytes();
   size_t items = mempool::unittest_2::allocated_items();
@@ -139,15 +136,20 @@ namespace mempool {
 // define memory pools
 
 #define DEFINE_MEMORY_POOLS_HELPER(f) \
-  f(unittest_1)			      \
-  f(unittest_2)			      \
-  f(buffer_meta)		      \
-  f(buffer_data)		      \
-  f(osd)			      \
+  f(bloom_filter)		      \
   f(bluestore_meta_onode)	      \
   f(bluestore_meta_other)	      \
   f(bluestore_alloc)		      \
-  f(bluefs)
+  f(bluestore_fsck)		      \
+  f(bluefs)			      \
+  f(buffer_meta)		      \
+  f(buffer_data)		      \
+  f(osd)			      \
+  f(osdmap)			      \
+  f(osdmap_mapping)		      \
+  f(unittest_1)			      \
+  f(unittest_2)
+
 
 // give them integer ids
 #define P(x) mempool_##x,
@@ -161,7 +163,6 @@ extern bool debug_mode;
 extern void set_debug_mode(bool d);
 
 // --------------------------------------------------------------
-struct pool_allocator_base_t;
 class pool_t;
 
 // we shard pool stats across many shard_t's to reduce the amount
@@ -246,8 +247,7 @@ public:
   void dump(ceph::Formatter *f) const;
 };
 
-// skip unittest_[12] by default
-void dump(ceph::Formatter *f, size_t skip=2);
+void dump(ceph::Formatter *f);
 
 
 // STL allocator for use with containers.  All actual state
@@ -367,23 +367,34 @@ public:
     static const mempool::pool_index_t id = mempool::mempool_##x;	\
     template<typename v>						\
     using pool_allocator = mempool::pool_allocator<id,v>;		\
+                                                                        \
+    using string = std::basic_string<char,std::char_traits<char>,       \
+                                     pool_allocator<char>>;             \
+                                                                        \
     template<typename k,typename v, typename cmp = std::less<k> >	\
     using map = std::map<k, v, cmp,					\
-			 pool_allocator<std::pair<k,v>>>;		\
+			 pool_allocator<std::pair<const k,v>>>;		\
+                                                                        \
     template<typename k,typename v, typename cmp = std::less<k> >	\
     using multimap = std::multimap<k,v,cmp,				\
-				   pool_allocator<std::pair<k,v>>>;	\
+				   pool_allocator<std::pair<const k,	\
+							    v>>>;	\
+                                                                        \
     template<typename k, typename cmp = std::less<k> >			\
     using set = std::set<k,cmp,pool_allocator<k>>;			\
+                                                                        \
     template<typename v>						\
     using list = std::list<v,pool_allocator<v>>;			\
+                                                                        \
     template<typename v>						\
     using vector = std::vector<v,pool_allocator<v>>;			\
+                                                                        \
     template<typename k, typename v,					\
 	     typename h=std::hash<k>,					\
 	     typename eq = std::equal_to<k>>				\
     using unordered_map =						\
-      std::unordered_map<k,v,h,eq,pool_allocator<std::pair<k,v>>>;	\
+      std::unordered_map<k,v,h,eq,pool_allocator<std::pair<const k,v>>>;\
+                                                                        \
     inline size_t allocated_bytes() {					\
       return mempool::get_pool(id).allocated_bytes();			\
     }									\
@@ -402,6 +413,13 @@ DEFINE_MEMORY_POOLS_HELPER(P)
 
 // Use this for any type that is contained by a container (unless it
 // is a class you defined; see below).
+#define MEMPOOL_DECLARE_FACTORY(obj, factoryname, pool)			\
+  namespace mempool {							\
+    namespace pool {							\
+      extern pool_allocator<obj> alloc_##factoryname;			\
+    }									\
+  }
+
 #define MEMPOOL_DEFINE_FACTORY(obj, factoryname, pool)			\
   namespace mempool {							\
     namespace pool {							\
@@ -418,10 +436,9 @@ DEFINE_MEMORY_POOLS_HELPER(P)
 //
 #define MEMPOOL_CLASS_HELPERS()						\
   void *operator new(size_t size);					\
-  void *operator new[](size_t size) {					\
+  void *operator new[](size_t size) noexcept {				\
     assert(0 == "no array new");					\
-    return (void*)1;							\
-  }									\
+    return nullptr; }							\
   void  operator delete(void *);					\
   void  operator delete[](void *) { assert(0 == "no array delete"); }
 

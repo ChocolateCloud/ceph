@@ -17,6 +17,7 @@
 #ifndef CEPH_CDIR_H
 #define CEPH_CDIR_H
 
+#include "include/counter.h"
 #include "include/types.h"
 #include "include/buffer_fwd.h"
 #include "common/bloom_filter.hpp"
@@ -41,27 +42,8 @@ class MDCache;
 struct ObjectOperation;
 
 ostream& operator<<(ostream& out, const class CDir& dir);
-class CDir : public MDSCacheObject {
+class CDir : public MDSCacheObject, public Counter<CDir> {
   friend ostream& operator<<(ostream& out, const class CDir& dir);
-
-  /*
-   * This class uses a boost::pool to handle allocation. This is *not*
-   * thread-safe, so don't do allocations from multiple threads!
-   *
-   * Alternatively, switch the pool to use a boost::singleton_pool.
-   */
-private:
-  static boost::pool<> pool;
-public:
-  static void *operator new(size_t num_bytes) { 
-    void *n = pool.malloc();
-    if (!n)
-      throw std::bad_alloc();
-    return n;
-  }
-  void operator delete(void *p) {
-    pool.free(p);
-  }
 
 public:
   // -- pins --
@@ -75,7 +57,7 @@ public:
   static const int PIN_EXPORTBOUND = 10;
   static const int PIN_STICKY =      11;
   static const int PIN_SUBTREETEMP = 12;  // used by MDCache::trim_non_auth()
-  const char *pin_name(int p) const {
+  const char *pin_name(int p) const override {
     switch (p) {
     case PIN_DNWAITER: return "dnwaiter";
     case PIN_INOWAITER: return "inowaiter";
@@ -99,6 +81,7 @@ public:
   static const unsigned STATE_FREEZINGDIR =   (1<< 5);
   static const unsigned STATE_COMMITTING =    (1<< 6);   // mid-commit
   static const unsigned STATE_FETCHING =      (1<< 7);   // currenting fetching
+  static const unsigned STATE_CREATING =      (1<< 8);
   static const unsigned STATE_IMPORTBOUND =   (1<<10);
   static const unsigned STATE_EXPORTBOUND =   (1<<11);
   static const unsigned STATE_EXPORTING =     (1<<12);
@@ -109,6 +92,7 @@ public:
   static const unsigned STATE_ASSIMRSTAT =    (1<<17);  // assimilating inode->frag rstats
   static const unsigned STATE_DIRTYDFT =      (1<<18);  // dirty dirfragtree
   static const unsigned STATE_BADFRAG =       (1<<19);  // bad dirfrag
+  static const unsigned STATE_AUXSUBTREE =    (1<<20);  // no subtree merge
 
   // common states
   static const unsigned STATE_CLEAN =  0;
@@ -134,6 +118,7 @@ public:
   (STATE_DIRTY|
    STATE_EXPORTBOUND |
    STATE_IMPORTBOUND |
+   STATE_AUXSUBTREE |
    STATE_REJOINUNDEF);
 
   // -- rep spec --
@@ -149,6 +134,7 @@ public:
   static const uint64_t WAIT_DENTRY       = (1<<0);  // wait for item to be in cache
   static const uint64_t WAIT_COMPLETE     = (1<<1);  // wait for complete dir contents
   static const uint64_t WAIT_FROZEN       = (1<<2);  // auth pins removed
+  static const uint64_t WAIT_CREATED	  = (1<<3);  // new dirfrag is logged
 
   static const int WAIT_DNLOCK_OFFSET = 4;
 
@@ -166,7 +152,7 @@ public:
   CInode          *inode;  // my inode
   frag_t           frag;   // my frag
 
-  bool is_lt(const MDSCacheObject *r) const {
+  bool is_lt(const MDSCacheObject *r) const override {
     return dirfrag() < (static_cast<const CDir*>(r))->dirfrag();
   }
 
@@ -394,6 +380,7 @@ protected:
   friend class CDirExport;
   friend class C_IO_Dir_TMAP_Fetched;
   friend class C_IO_Dir_OMAP_Fetched;
+  friend class C_IO_Dir_OMAP_FetchedMore;
   friend class C_IO_Dir_Committed;
 
   std::unique_ptr<bloom_filter> bloom;
@@ -402,10 +389,6 @@ protected:
 
  public:
   CDir(CInode *in, frag_t fg, MDCache *mdcache, bool auth);
-  ~CDir() {
-    g_num_dir--;
-    g_num_dirs++;
-  }
 
   const scrub_info_t *scrub_info() const {
     if (!scrub_infop) {
@@ -426,6 +409,7 @@ protected:
 
   map_t::iterator begin() { return items.begin(); }
   map_t::iterator end() { return items.end(); }
+  map_t::iterator lower_bound(dentry_key_t key) { return items.lower_bound(key); }
 
   unsigned get_num_head_items() const { return num_head_items; }
   unsigned get_num_head_null() const { return num_head_null; }
@@ -444,7 +428,9 @@ protected:
     return num_dirty;
   }
 
-  int64_t get_frag_size() { return get_projected_fnode()->fragstat.size(); }
+  int64_t get_frag_size() const {
+    return get_projected_fnode()->fragstat.size();
+  }
 
   // -- dentries and inodes --
  public:
@@ -488,10 +474,11 @@ public:
   void split(int bits, list<CDir*>& subs, list<MDSInternalContextBase*>& waiters, bool replay);
   void merge(list<CDir*>& subs, list<MDSInternalContextBase*>& waiters, bool replay);
 
-  bool should_split() {
+  bool should_split() const {
     return (int)get_frag_size() > g_conf->mds_bal_split_size;
   }
-  bool should_merge() {
+  bool should_split_fast() const;
+  bool should_merge() const {
     return (int)get_frag_size() < g_conf->mds_bal_merge_size;
   }
 
@@ -515,7 +502,7 @@ private:
   std::string get_path() const;
 
  public:
-  mds_authority_t authority() const;
+  mds_authority_t authority() const override;
   mds_authority_t get_dir_auth() const { return dir_auth; }
   void set_dir_auth(mds_authority_t a);
   void set_dir_auth(mds_rank_t a) { set_dir_auth(mds_authority_t(a, CDIR_AUTH_UNKNOWN)); }
@@ -610,6 +597,9 @@ protected:
   compact_set<string> wanted_items;
 
   void _omap_fetch(MDSInternalContextBase *fin, const std::set<dentry_key_t>& keys);
+  void _omap_fetch_more(
+    bufferlist& hdrbl, std::map<std::string, bufferlist>& omap,
+    MDSInternalContextBase *fin);
   CDentry *_load_dentry(
       const std::string &key,
       const std::string &dname,
@@ -661,8 +651,8 @@ public:
 
 
   // -- reference counting --
-  void first_get();
-  void last_put();
+  void first_get() override;
+  void last_put() override;
 
   void request_pin_get() {
     if (request_pins == 0) get(PIN_REQUEST);
@@ -685,8 +675,8 @@ public:
   void take_dentry_waiting(const std::string& dentry, snapid_t first, snapid_t last, std::list<MDSInternalContextBase*>& ls);
   void take_sub_waiting(std::list<MDSInternalContextBase*>& ls);  // dentry or ino
 
-  void add_waiter(uint64_t mask, MDSInternalContextBase *c);
-  void take_waiting(uint64_t mask, std::list<MDSInternalContextBase*>& ls);  // may include dentry waiters
+  void add_waiter(uint64_t mask, MDSInternalContextBase *c) override;
+  void take_waiting(uint64_t mask, std::list<MDSInternalContextBase*>& ls) override;  // may include dentry waiters
   void finish_waiting(uint64_t mask, int result = 0);    // ditto
   
 
@@ -699,13 +689,13 @@ public:
   void decode_import(bufferlist::iterator& blp, utime_t now, LogSegment *ls);
 
   // -- auth pins --
-  bool can_auth_pin() const { return is_auth() && !(is_frozen() || is_freezing()); }
+  bool can_auth_pin() const override { return is_auth() && !(is_frozen() || is_freezing()); }
   int get_cum_auth_pins() const { return auth_pins + nested_auth_pins; }
   int get_auth_pins() const { return auth_pins; }
   int get_nested_auth_pins() const { return nested_auth_pins; }
   int get_dir_auth_pins() const { return dir_auth_pins; }
-  void auth_pin(void *who);
-  void auth_unpin(void *who);
+  void auth_pin(void *who) override;
+  void auth_unpin(void *who) override;
 
   void adjust_nested_auth_pins(int inc, int dirinc, void *by);
   void verify_fragstat();
@@ -721,12 +711,12 @@ public:
 
   void maybe_finish_freeze();
 
-  bool is_freezing() const { return is_freezing_tree() || is_freezing_dir(); }
+  bool is_freezing() const override { return is_freezing_tree() || is_freezing_dir(); }
   bool is_freezing_tree() const;
   bool is_freezing_tree_root() const { return state & STATE_FREEZINGTREE; }
   bool is_freezing_dir() const { return state & STATE_FREEZINGDIR; }
 
-  bool is_frozen() const { return is_frozen_dir() || is_frozen_tree(); }
+  bool is_frozen() const override { return is_frozen_dir() || is_frozen_tree(); }
   bool is_frozen_tree() const;
   bool is_frozen_tree_root() const { return state & STATE_FROZENTREE; }
   bool is_frozen_dir() const { return state & STATE_FROZENDIR; }
@@ -756,8 +746,8 @@ public:
   CDir *get_frozen_tree_root();
 
 
-  ostream& print_db_line_prefix(ostream& out);
-  void print(ostream& out);
+  ostream& print_db_line_prefix(ostream& out) override;
+  void print(ostream& out) override;
   void dump(Formatter *f) const;
 };
 

@@ -57,6 +57,7 @@
 
 #include <gtest/gtest.h>
 
+
 #if GTEST_HAS_PARAM_TEST
 
 class EventDriverTest : public ::testing::TestWithParam<const char*> {
@@ -64,7 +65,7 @@ class EventDriverTest : public ::testing::TestWithParam<const char*> {
   EventDriver *driver;
 
   EventDriverTest(): driver(0) {}
-  virtual void SetUp() {
+  void SetUp() override {
     cerr << __func__ << " start set up " << GetParam() << std::endl;
 #ifdef HAVE_EPOLL
     if (strcmp(GetParam(), "epoll"))
@@ -78,7 +79,7 @@ class EventDriverTest : public ::testing::TestWithParam<const char*> {
       driver = new SelectDriver(g_ceph_context);
     driver->init(NULL, 100);
   }
-  virtual void TearDown() {
+  void TearDown() override {
     delete driver;
   }
 };
@@ -147,6 +148,7 @@ void* echoclient(void *arg)
   sa.sin_port = htons(port);
   char addr[] = "127.0.0.1";
   int r = inet_pton(AF_INET, addr, &sa.sin_addr);
+  assert(r == 1);
 
   int connect_sd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (connect_sd >= 0) {
@@ -249,13 +251,13 @@ TEST_P(EventDriverTest, NetworkSocketTest) {
 class FakeEvent : public EventCallback {
 
  public:
-  void do_request(int fd_or_id) {}
+  void do_request(int fd_or_id) override {}
 };
 
 TEST(EventCenterTest, FileEventExpansion) {
   vector<int> sds;
   EventCenter center(g_ceph_context);
-  center.init(100, 0);
+  center.init(100, 0, "posix");
   center.set_owner();
   EventCallbackRef e(new FakeEvent());
   for (int i = 0; i < 300; i++) {
@@ -276,13 +278,13 @@ class Worker : public Thread {
  public:
   EventCenter center;
   explicit Worker(CephContext *c, int idx): cct(c), done(false), center(c) {
-    center.init(100, idx);
+    center.init(100, idx, "posix");
   }
   void stop() {
     done = true; 
     center.wakeup();
   }
-  void* entry() {
+  void* entry() override {
     center.set_owner();
     while (!done)
       center.process_events(1000000);
@@ -297,7 +299,7 @@ class CountEvent: public EventCallback {
 
  public:
   CountEvent(atomic_t *atomic, Mutex *l, Cond *c): count(atomic), lock(l), cond(c) {}
-  void do_request(int id) {
+  void do_request(int id) override {
     lock->Lock();
     count->dec();
     cond->Signal();
@@ -353,17 +355,6 @@ TEST(DummyTest, ValueParameterizedTestsAreNotSupportedOnThisPlatform) {}
 
 #endif
 
-
-int main(int argc, char **argv) {
-  vector<const char*> args;
-  argv_to_vec(argc, (const char **)argv, args);
-
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
-  common_init_finish(g_ceph_context);
-
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}
 
 /*
  * Local Variables:

@@ -18,7 +18,6 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <stdlib.h>
-#include "include/int_types.h"
 #include "include/uuid.h"
 
 #ifdef __linux__
@@ -46,6 +45,7 @@ int get_block_device_size(int fd, int64_t *psize)
   int ret = ::ioctl(fd, BLKGETSIZE, &sectors);
   *psize = sectors * 512ULL;
 #else
+// cppcheck-suppress preprocessorErrorDirective
 # error "Linux configuration error (get_block_device_size)"
 #endif
   if (ret < 0)
@@ -65,21 +65,23 @@ int get_block_device_base(const char *dev, char *out, size_t out_len)
   struct stat st;
   int r = 0;
   DIR *dir;
-  char devname[PATH_MAX], fn[PATH_MAX];
+  char devname[PATH_MAX] = {0}, fn[PATH_MAX] = {0};
   char *p;
   char realname[PATH_MAX] = {0};
 
   if (strncmp(dev, "/dev/", 5) != 0) {
-    if ((readlink(dev, realname, sizeof(realname)) == -1) || (strncmp(realname, "/dev/", 5) != 0))
+    if (realpath(dev, realname) == NULL || (strncmp(realname, "/dev/", 5) != 0)) {
       return -EINVAL;
+    }
   }
 
   if (strlen(realname))
-    strncpy(devname, realname + 5, PATH_MAX -1);
+    strncpy(devname, realname + 5, PATH_MAX - 5);
   else
-    strncpy(devname, dev + 5, PATH_MAX-1);
+    strncpy(devname, dev + 5, strlen(dev) - 5);
 
-  devname[PATH_MAX-1] = '\0';
+  devname[PATH_MAX - 1] = '\0';
+
   for (p = devname; *p; ++p)
     if (*p == '/')
       *p = '!';
@@ -124,6 +126,40 @@ int get_block_device_base(const char *dev, char *out, size_t out_len)
 }
 
 /**
+ * get a block device property as a string
+ *
+ * store property in *val, up to maxlen chars
+ * return 0 on success
+ * return negative error on error
+ */
+int64_t get_block_device_string_property(const char *devname,
+					 const char *property,
+					 char *val, size_t maxlen)
+{
+  char filename[PATH_MAX];
+  snprintf(filename, sizeof(filename),
+	   "%s/sys/block/%s/%s", sandbox_dir, devname, property);
+
+  FILE *fp = fopen(filename, "r");
+  if (fp == NULL) {
+    return -errno;
+  }
+
+  int r = 0;
+  if (fgets(val, maxlen - 1, fp)) {
+    // truncate at newline
+    char *p = val;
+    while (*p && *p != '\n')
+      ++p;
+    *p = 0;
+  } else {
+    r = -EINVAL;
+  }
+  fclose(fp);
+  return r;
+}
+
+/**
  * get a block device property
  *
  * return the value (we assume it is positive)
@@ -131,44 +167,27 @@ int get_block_device_base(const char *dev, char *out, size_t out_len)
  */
 int64_t get_block_device_int_property(const char *devname, const char *property)
 {
-  char basename[PATH_MAX], filename[PATH_MAX];
-  int64_t r;
-
-  r = get_block_device_base(devname, basename, sizeof(basename));
+  char buff[256] = {0};
+  int r = get_block_device_string_property(devname, property, buff, sizeof(buff));
   if (r < 0)
     return r;
-
-  snprintf(filename, sizeof(filename),
-	   "%s/sys/block/%s/queue/%s", sandbox_dir, basename, property);
-
-  FILE *fp = fopen(filename, "r");
-  if (fp == NULL) {
-    return -errno;
-  }
-
-  char buff[256] = {0};
-  if (fgets(buff, sizeof(buff) - 1, fp)) {
-    // strip newline etc
-    for (char *p = buff; *p; ++p) {
-      if (!isdigit(*p)) {
-	*p = 0;
-	break;
-      }
+  // take only digits
+  for (char *p = buff; *p; ++p) {
+    if (!isdigit(*p)) {
+      *p = 0;
+      break;
     }
-    char *endptr = 0;
-    r = strtoll(buff, &endptr, 10);
-    if (endptr != buff + strlen(buff))
-      r = -EINVAL;
-  } else {
-    r = 0;
   }
-  fclose(fp);
+  char *endptr = 0;
+  r = strtoll(buff, &endptr, 10);
+  if (endptr != buff + strlen(buff))
+    r = -EINVAL;
   return r;
 }
 
 bool block_device_support_discard(const char *devname)
 {
-  return get_block_device_int_property(devname, "discard_granularity") > 0;
+  return get_block_device_int_property(devname, "queue/discard_granularity") > 0;
 }
 
 int block_device_discard(int fd, int64_t offset, int64_t len)
@@ -179,7 +198,12 @@ int block_device_discard(int fd, int64_t offset, int64_t len)
 
 bool block_device_is_rotational(const char *devname)
 {
-  return get_block_device_int_property(devname, "rotational") > 0;
+  return get_block_device_int_property(devname, "queue/rotational") > 0;
+}
+
+int block_device_model(const char *devname, char *model, size_t max)
+{
+  return get_block_device_string_property(devname, "device/model", model, max);
 }
 
 int get_device_by_uuid(uuid_d dev_uuid, const char* label, char* partition,
@@ -197,7 +221,7 @@ int get_device_by_uuid(uuid_d dev_uuid, const char* label, char* partition,
   if (blkid_get_cache(&cache, NULL) >= 0)
     dev = blkid_find_dev_with_tag(cache, label, (const char*)uuid_str);
   else
-    rc = -EINVAL;
+    return -EINVAL;
 
   if (dev) {
     temp_partition_ptr = blkid_dev_devname(dev);
@@ -220,6 +244,29 @@ int get_device_by_uuid(uuid_d dev_uuid, const char* label, char* partition,
     blkid_put_cache(cache);
   return rc;
 }
+
+int get_device_by_fd(int fd, char *partition, char *device, size_t max)
+{
+  struct stat st;
+  int r = fstat(fd, &st);
+  if (r < 0) {
+    return -EINVAL;  // hrm.
+  }
+  dev_t devid = S_ISBLK(st.st_mode) ? st.st_rdev : st.st_dev;
+  char *t = blkid_devno_to_devname(devid);
+  if (!t) {
+    return -EINVAL;
+  }
+  strncpy(partition, t, max);
+  free(t);
+  dev_t diskdev;
+  r = blkid_devno_to_wholedisk(devid, device, max, &diskdev);
+  if (r < 0) {
+    return -EINVAL;
+  }
+  return 0;
+}
+
 #elif defined(__APPLE__)
 #include <sys/disk.h>
 
@@ -289,6 +336,10 @@ int get_device_by_uuid(uuid_d dev_uuid, const char* label, char* partition,
 {
   return -EOPNOTSUPP;
 }
+int get_device_by_fd(int fd, char* partition, char* device)
+{
+  return -EOPNOTSUPP;
+}
 #else
 int get_block_device_size(int fd, int64_t *psize)
 {
@@ -312,6 +363,11 @@ bool block_device_is_rotational(const char *devname)
 
 int get_device_by_uuid(uuid_d dev_uuid, const char* label, char* partition,
 	char* device)
+{
+  return -EOPNOTSUPP;
+}
+
+int get_device_by_fd(int fd, char* partition, char* device)
 {
   return -EOPNOTSUPP;
 }

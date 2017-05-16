@@ -206,8 +206,7 @@ public:
   }
 
   bool handle_log_ack(MLogAck *m);
-  void reset_session();
-  Message *get_mon_log_message();
+  Message *get_mon_log_message(bool flush);
   bool are_pending();
 
   LogChannelRef create_channel() {
@@ -219,7 +218,7 @@ public:
     if (channels.count(name))
       c = channels[name];
     else {
-      c = LogChannelRef(new LogChannel(cct, this, name));
+      c = std::make_shared<LogChannel>(cct, this, name);
       channels[name] = c;
     }
     return c;

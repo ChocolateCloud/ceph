@@ -7,7 +7,8 @@
 #define TIME_BUF_SIZE 128
 
 #include <boost/utility/string_ref.hpp>
-
+#include <boost/container/flat_set.hpp>
+#include "common/sstring.hh"
 #include "common/ceph_json.h"
 #include "include/assert.h" /* needed because of common/ceph_json.h */
 #include "rgw_op.h"
@@ -28,11 +29,11 @@ extern void rgw_flush_formatter(struct req_state *s,
 				ceph::Formatter *formatter);
 
 extern int rgw_rest_read_all_input(struct req_state *s, char **data, int *plen,
-				   int max_len);
+				   uint64_t max_len, bool allow_chunked=true);
 
 template <class T>
 int rgw_rest_get_json_input(CephContext *cct, req_state *s, T& out,
-			    int max_len, bool *empty)
+			    uint64_t max_len, bool *empty)
 {
   int rv, data_len;
   char *data;
@@ -71,7 +72,7 @@ int rgw_rest_get_json_input(CephContext *cct, req_state *s, T& out,
 }
 
 template <class T>
-int rgw_rest_get_json_input_keep_data(CephContext *cct, req_state *s, T& out, int max_len, char **pdata, int *len)
+int rgw_rest_get_json_input_keep_data(CephContext *cct, req_state *s, T& out, uint64_t max_len, char **pdata, int *len)
 {
   int rv, data_len;
   char *data;
@@ -131,8 +132,8 @@ class RGWRESTFlusher : public RGWFormatterFlusher {
   struct req_state *s;
   RGWOp *op;
 protected:
-  virtual void do_flush();
-  virtual void do_start(int ret);
+  void do_flush() override;
+  void do_start(int ret) override;
 public:
   RGWRESTFlusher(struct req_state *_s, RGWOp *_op) :
     RGWFormatterFlusher(_s->formatter), s(_s), op(_op) {}
@@ -152,236 +153,304 @@ protected:
 public:
   RGWGetObj_ObjStore() : sent_header(false) {}
 
-  virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {
+  void init(RGWRados *store, struct req_state *s, RGWHandler *h) override {
     RGWGetObj::init(store, s, h);
     sent_header = false;
   }
 
-  int get_params();
+  int get_params() override;
 };
 
 class RGWListBuckets_ObjStore : public RGWListBuckets {
 public:
   RGWListBuckets_ObjStore() {}
-  ~RGWListBuckets_ObjStore() {}
+  ~RGWListBuckets_ObjStore() override {}
 };
 
 class RGWGetUsage_ObjStore : public RGWGetUsage {
 public:
   RGWGetUsage_ObjStore() {}
-  ~RGWGetUsage_ObjStore() {}
+  ~RGWGetUsage_ObjStore() override {}
 };
 
 class RGWListBucket_ObjStore : public RGWListBucket {
 public:
   RGWListBucket_ObjStore() {}
-  ~RGWListBucket_ObjStore() {}
+  ~RGWListBucket_ObjStore() override {}
 };
 
 class RGWStatAccount_ObjStore : public RGWStatAccount {
 public:
   RGWStatAccount_ObjStore() {}
-  ~RGWStatAccount_ObjStore() {}
+  ~RGWStatAccount_ObjStore() override {}
 };
 
 class RGWStatBucket_ObjStore : public RGWStatBucket {
 public:
   RGWStatBucket_ObjStore() {}
-  ~RGWStatBucket_ObjStore() {}
+  ~RGWStatBucket_ObjStore() override {}
 };
 
 class RGWCreateBucket_ObjStore : public RGWCreateBucket {
 public:
   RGWCreateBucket_ObjStore() {}
-  ~RGWCreateBucket_ObjStore() {}
+  ~RGWCreateBucket_ObjStore() override {}
 };
 
 class RGWDeleteBucket_ObjStore : public RGWDeleteBucket {
 public:
   RGWDeleteBucket_ObjStore() {}
-  ~RGWDeleteBucket_ObjStore() {}
+  ~RGWDeleteBucket_ObjStore() override {}
 };
 
 class RGWPutObj_ObjStore : public RGWPutObj
 {
 public:
   RGWPutObj_ObjStore() {}
-  ~RGWPutObj_ObjStore() {}
+  ~RGWPutObj_ObjStore() override {}
 
-  virtual int verify_params();
-  virtual int get_params();
-  virtual int get_data(bufferlist& bl);
+  int verify_params() override;
+  int get_params() override;
+  int get_data(bufferlist& bl) override;
 
   int get_padding_last_aws4_chunk_encoded(bufferlist &bl, uint64_t chunk_size);
 };
 
 class RGWPostObj_ObjStore : public RGWPostObj
 {
+  std::string boundary;
+
+public:
+  struct post_part_field {
+    std::string val;
+    std::map<std::string, std::string> params;
+  };
+
+  struct post_form_part {
+    std::string name;
+    std::map<std::string, post_part_field, ltstr_nocase> fields;
+    ceph::bufferlist data;
+  };
+
+protected:
+  using parts_collection_t = \
+    std::map<std::string, post_form_part, const ltstr_nocase>;
+
+  std::string err_msg;
+  ceph::bufferlist in_data;
+
+  int read_with_boundary(ceph::bufferlist& bl,
+                         uint64_t max,
+                         bool check_eol,
+                         bool& reached_boundary,
+                         bool& done);
+
+  int read_line(ceph::bufferlist& bl,
+                uint64_t max,
+                bool& reached_boundary,
+                bool& done);
+
+  int read_data(ceph::bufferlist& bl,
+                uint64_t max,
+                bool& reached_boundary,
+                bool& done);
+
+  int read_form_part_header(struct post_form_part *part, bool& done);
+
+  int get_params() override;
+
+  static int parse_part_field(const std::string& line,
+                              std::string& field_name, /* out */
+                              post_part_field& field); /* out */
+
+  static void parse_boundary_params(const std::string& params_str,
+                                    std::string& first,
+                                    std::map<std::string, std::string>& params);
+
+  static bool part_str(parts_collection_t& parts,
+                       const std::string& name,
+                       std::string *val);
+
+  static std::string get_part_str(parts_collection_t& parts,
+                                  const std::string& name,
+                                  const std::string& def_val = std::string());
+
+  static bool part_bl(parts_collection_t& parts,
+                      const std::string& name,
+                      ceph::bufferlist *pbl);
+
 public:
   RGWPostObj_ObjStore() {}
-  ~RGWPostObj_ObjStore() {}
+  ~RGWPostObj_ObjStore() override {}
 
-  virtual int verify_params();
+  int verify_params() override;
 };
+
 
 class RGWPutMetadataAccount_ObjStore : public RGWPutMetadataAccount
 {
 public:
   RGWPutMetadataAccount_ObjStore() {}
-  ~RGWPutMetadataAccount_ObjStore() {}
+  ~RGWPutMetadataAccount_ObjStore() override {}
 };
 
 class RGWPutMetadataBucket_ObjStore : public RGWPutMetadataBucket
 {
 public:
   RGWPutMetadataBucket_ObjStore() {}
-  ~RGWPutMetadataBucket_ObjStore() {}
+  ~RGWPutMetadataBucket_ObjStore() override {}
 };
 
 class RGWPutMetadataObject_ObjStore : public RGWPutMetadataObject
 {
 public:
   RGWPutMetadataObject_ObjStore() {}
-  ~RGWPutMetadataObject_ObjStore() {}
+  ~RGWPutMetadataObject_ObjStore() override {}
 };
 
 class RGWDeleteObj_ObjStore : public RGWDeleteObj {
 public:
   RGWDeleteObj_ObjStore() {}
-  ~RGWDeleteObj_ObjStore() {}
+  ~RGWDeleteObj_ObjStore() override {}
 };
 
 class  RGWGetCrossDomainPolicy_ObjStore : public RGWGetCrossDomainPolicy {
 public:
   RGWGetCrossDomainPolicy_ObjStore() = default;
-  ~RGWGetCrossDomainPolicy_ObjStore() = default;
+  ~RGWGetCrossDomainPolicy_ObjStore() override = default;
 };
 
 class  RGWGetHealthCheck_ObjStore : public RGWGetHealthCheck {
 public:
   RGWGetHealthCheck_ObjStore() = default;
-  ~RGWGetHealthCheck_ObjStore() = default;
+  ~RGWGetHealthCheck_ObjStore() override = default;
 };
 
 class RGWCopyObj_ObjStore : public RGWCopyObj {
 public:
   RGWCopyObj_ObjStore() {}
-  ~RGWCopyObj_ObjStore() {}
+  ~RGWCopyObj_ObjStore() override {}
 };
 
 class RGWGetACLs_ObjStore : public RGWGetACLs {
 public:
   RGWGetACLs_ObjStore() {}
-  ~RGWGetACLs_ObjStore() {}
+  ~RGWGetACLs_ObjStore() override {}
 };
 
 class RGWPutACLs_ObjStore : public RGWPutACLs {
 public:
   RGWPutACLs_ObjStore() {}
-  ~RGWPutACLs_ObjStore() {}
+  ~RGWPutACLs_ObjStore() override {}
 
-  virtual int get_params();
+  int get_params() override;
 };
 
 class RGWGetLC_ObjStore : public RGWGetLC {
 public:
   RGWGetLC_ObjStore() {}
-  ~RGWGetLC_ObjStore() {}
+  ~RGWGetLC_ObjStore() override {}
 };
 
 class RGWPutLC_ObjStore : public RGWPutLC {
 public:
   RGWPutLC_ObjStore() {}
-  ~RGWPutLC_ObjStore() {}
+  ~RGWPutLC_ObjStore() override {}
 
-  int get_params();
+  int get_params() override;
 };
 
 class RGWDeleteLC_ObjStore : public RGWDeleteLC {
 public:
   RGWDeleteLC_ObjStore() {}
-  ~RGWDeleteLC_ObjStore() {}
+  ~RGWDeleteLC_ObjStore() override {}
 
 };
 
 class RGWGetCORS_ObjStore : public RGWGetCORS {
 public:
   RGWGetCORS_ObjStore() {}
-  ~RGWGetCORS_ObjStore() {}
+  ~RGWGetCORS_ObjStore() override {}
 };
 
 class RGWPutCORS_ObjStore : public RGWPutCORS {
 public:
   RGWPutCORS_ObjStore() {}
-  ~RGWPutCORS_ObjStore() {}
+  ~RGWPutCORS_ObjStore() override {}
 };
 
 class RGWDeleteCORS_ObjStore : public RGWDeleteCORS {
 public:
   RGWDeleteCORS_ObjStore() {}
-  ~RGWDeleteCORS_ObjStore() {}
+  ~RGWDeleteCORS_ObjStore() override {}
 };
 
 class RGWOptionsCORS_ObjStore : public RGWOptionsCORS {
 public:
   RGWOptionsCORS_ObjStore() {}
-  ~RGWOptionsCORS_ObjStore() {}
+  ~RGWOptionsCORS_ObjStore() override {}
 };
 
 class RGWInitMultipart_ObjStore : public RGWInitMultipart {
 public:
   RGWInitMultipart_ObjStore() {}
-  ~RGWInitMultipart_ObjStore() {}
+  ~RGWInitMultipart_ObjStore() override {}
 };
 
 class RGWCompleteMultipart_ObjStore : public RGWCompleteMultipart {
 public:
   RGWCompleteMultipart_ObjStore() {}
-  ~RGWCompleteMultipart_ObjStore() {}
+  ~RGWCompleteMultipart_ObjStore() override {}
 
-  virtual int get_params();
+  int get_params() override;
 };
 
 class RGWAbortMultipart_ObjStore : public RGWAbortMultipart {
 public:
   RGWAbortMultipart_ObjStore() {}
-  ~RGWAbortMultipart_ObjStore() {}
+  ~RGWAbortMultipart_ObjStore() override {}
 };
 
 class RGWListMultipart_ObjStore : public RGWListMultipart {
 public:
   RGWListMultipart_ObjStore() {}
-  ~RGWListMultipart_ObjStore() {}
+  ~RGWListMultipart_ObjStore() override {}
 
-  int get_params();
+  int get_params() override;
 };
 
 class RGWListBucketMultiparts_ObjStore : public RGWListBucketMultiparts {
 public:
   RGWListBucketMultiparts_ObjStore() {}
-  ~RGWListBucketMultiparts_ObjStore() {}
+  ~RGWListBucketMultiparts_ObjStore() override {}
 
-  int get_params();
+  int get_params() override;
 };
 
 class RGWBulkDelete_ObjStore : public RGWBulkDelete {
 public:
   RGWBulkDelete_ObjStore() {}
-  ~RGWBulkDelete_ObjStore() {}
+  ~RGWBulkDelete_ObjStore() override {}
+};
+
+class RGWBulkUploadOp_ObjStore : public RGWBulkUploadOp {
+public:
+  RGWBulkUploadOp_ObjStore() = default;
+  ~RGWBulkUploadOp_ObjStore() = default;
 };
 
 class RGWDeleteMultiObj_ObjStore : public RGWDeleteMultiObj {
 public:
   RGWDeleteMultiObj_ObjStore() {}
-  ~RGWDeleteMultiObj_ObjStore() {}
+  ~RGWDeleteMultiObj_ObjStore() override {}
 
-  virtual int get_params();
+  int get_params() override;
 };
 
 class RGWInfo_ObjStore : public RGWInfo {
 public:
     RGWInfo_ObjStore() = default;
-    ~RGWInfo_ObjStore() = default;
+    ~RGWInfo_ObjStore() override = default;
 };
 
 class RGWRESTOp : public RGWOp {
@@ -390,19 +459,20 @@ protected:
   RGWRESTFlusher flusher;
 public:
   RGWRESTOp() : http_ret(0) {}
-  virtual void init(RGWRados *store, struct req_state *s,
-		    RGWHandler *dialect_handler) {
+  void init(RGWRados *store, struct req_state *s,
+            RGWHandler *dialect_handler) override {
     RGWOp::init(store, s, dialect_handler);
     flusher.init(s, this);
   }
-  virtual void send_response();
+  void send_response() override;
   virtual int check_caps(RGWUserCaps& caps)
     { return -EPERM; } /* should to be implemented! */
-  virtual int verify_permission();
+  int verify_permission() override;
 };
 
 class RGWHandler_REST : public RGWHandler {
 protected:
+
   virtual bool is_obj_update_op() { return false; }
   virtual RGWOp *op_get() { return NULL; }
   virtual RGWOp *op_put() { return NULL; }
@@ -419,14 +489,14 @@ public:
   static constexpr int MAX_OBJ_NAME_LEN = 1024;
 
   RGWHandler_REST() {}
-  virtual ~RGWHandler_REST() {}
+  ~RGWHandler_REST() override {}
 
   static int validate_tenant_name(const string& bucket);
   static int validate_bucket_name(const string& bucket);
   static int validate_object_name(const string& object);
 
-  int init_permissions(RGWOp* op);
-  int read_permissions(RGWOp* op);
+  int init_permissions(RGWOp* op) override;
+  int read_permissions(RGWOp* op) override;
 
   virtual RGWOp* get_op(RGWRados* store);
   virtual void put_op(RGWOp* op);
@@ -436,9 +506,17 @@ class RGWHandler_REST_SWIFT;
 class RGWHandler_SWIFT_Auth;
 class RGWHandler_REST_S3;
 
+namespace rgw {
+namespace auth {
+
+class StrategyRegistry;
+
+}
+}
 
 class RGWRESTMgr {
   bool should_log;
+
 protected:
   std::map<std::string, RGWRESTMgr*> resource_mgrs;
   std::multimap<size_t, std::string> resources_by_size;
@@ -473,8 +551,11 @@ public:
     return get_resource_mgr(s, frontend_prefix + uri, out_uri);
   }
 
-  virtual RGWHandler_REST* get_handler(struct req_state* const s,
-                                       const std::string& frontend_prefix) {
+  virtual RGWHandler_REST* get_handler(
+    struct req_state* const s,
+    const rgw::auth::StrategyRegistry& auth_registry,
+    const std::string& frontend_prefix
+  ) {
     return nullptr;
   }
 
@@ -495,6 +576,8 @@ class RGWLibIO;
 class RGWRestfulIO;
 
 class RGWREST {
+  using x_header = basic_sstring<char, uint16_t, 32>;
+  boost::container::flat_set<x_header> x_headers;
   RGWRESTMgr mgr;
 
   static int preprocess(struct req_state *s, rgw::io::BasicClient* rio);
@@ -502,6 +585,7 @@ public:
   RGWREST() {}
   RGWHandler_REST *get_handler(RGWRados *store,
                                struct req_state *s,
+                               const rgw::auth::StrategyRegistry& auth_registry,
                                const std::string& frontend_prefix,
                                RGWRestfulIO *rio,
                                RGWRESTMgr **pmgr,
@@ -511,6 +595,7 @@ public:
 			  RGWLibIO *io, RGWRESTMgr **pmgr,
 			  int *init_error);
 #endif
+
   void put_handler(RGWHandler_REST *handler) {
     mgr.put_handler(handler);
   }
@@ -522,8 +607,19 @@ public:
 
     mgr.register_resource(resource, m);
   }
+
   void register_default_mgr(RGWRESTMgr *m) {
     mgr.register_default_mgr(m);
+  }
+
+  void register_x_headers(const std::string& headers);
+
+  bool log_x_headers(void) {
+    return (x_headers.size() > 0);
+  }
+
+  bool log_x_header(const std::string& header) {
+    return (x_headers.find(header) != x_headers.end());
   }
 };
 
@@ -545,7 +641,7 @@ extern void end_header(struct req_state *s,
 		       bool force_no_error = false);
 extern void dump_start(struct req_state *s);
 extern void list_all_buckets_start(struct req_state *s);
-extern void dump_owner(struct req_state *s, rgw_user& id, string& name,
+extern void dump_owner(struct req_state *s, const rgw_user& id, string& name,
 		       const char *section = NULL);
 extern void dump_header(struct req_state* s,
                         const boost::string_ref& name,

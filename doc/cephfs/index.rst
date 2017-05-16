@@ -97,6 +97,8 @@ authentication keyring.
     Disaster recovery <disaster-recovery>
     Client authentication <client-auth>
     Upgrading old filesystems <upgrading>
+    Configuring directory fragmentation <dirfrags>
+    Configuring multiple active MDS daemons <multimds>
 
 .. raw:: html
 
@@ -108,6 +110,7 @@ For developers
 .. toctree:: 
     :maxdepth: 1
 
+    Client's Capabilities <capabilities>
     libcephfs <../../api/libcephfs-java/>
     Mantle <mantle>
 

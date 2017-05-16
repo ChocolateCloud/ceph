@@ -47,6 +47,11 @@ Ceph configuration file, the default value will be set automatically.
 :Type: String
 :Default: N/A
 
+``rgw fcgi socket backlog``
+
+:Description: The socket backlog for fcgi.
+:Type: Integer
+:Default: ``1024``
 
 ``rgw host``
 
@@ -133,7 +138,7 @@ Ceph configuration file, the default value will be set automatically.
 
 ``rgw num rados handles``
 
-:Description: The numer of the `RADOS cluster handles`_ for Ceph Object Gateway.
+:Description: The number of `RADOS cluster handles`_ for Ceph Object Gateway.
               Having a configurable number of RADOS handles is resulting in
               significant performance boost for all types of workloads. Each RGW
               worker thread would now get to pick a RADOS handle for its lifetime,
@@ -378,16 +383,6 @@ Ceph configuration file, the default value will be set automatically.
               if no other quota is specified.  Has no effect on existing users.
 :Type: Integer
 :Default: ``-1``
-
-
-``rgw compression type``
-
-:Description: The compression plugin to use when writing object data. Each
-              compressed object remembers which plugin was used, so changing
-              this setting does not hinder the ability to decompress existing
-              objects, not does it force existing objects to be recompressed.
-:Type: String
-:Default: ``none``
 
 
 Regions
@@ -946,6 +941,17 @@ Logging Settings
 :Default: ``30``
 
 
+``rgw log http headers``
+
+:Description: Comma-delimited list of HTTP headers to include with ops
+	      log entries.  Header names are case insensitive, and use
+	      the full header name with words separated by underscores.
+
+:Type: String
+:Default: None
+:Example: "http_x_forwarded_for, http_x_special_k"
+
+
 ``rgw intent log object name``
 
 :Description: The logging format for the intent log object name. See manpage 
@@ -1109,7 +1115,53 @@ Keystone Settings
 :Type: Boolean
 :Default: ``true``
 
+Barbican Settings
+=================
+
+``rgw barbican url``
+
+:Description: The URL for the Barbican server.
+:Type: String
+:Default: None
+
+``rgw keystone barbican user``
+
+:Description: The name of the OpenStack user with access to the `Barbican`_
+              secrets used for `Encryption`_.
+:Type: String
+:Default: None
+
+``rgw keystone barbican password``
+
+:Description: The password associated with the `Barbican`_ user.
+:Type: String
+:Default: None
+
+``rgw keystone barbican tenant``
+
+:Description: The name of the OpenStack tenant associated with the `Barbican`_
+              user when using OpenStack Identity API v2.
+:Type: String
+:Default: None
+
+``rgw keystone barbican project``
+
+:Description: The name of the OpenStack project associated with the `Barbican`_
+              user when using OpenStack Identity API v3.
+:Type: String
+:Default: None
+
+``rgw keystone barbican domain``
+
+:Description: The name of the OpenStack domain associated with the `Barbican`_
+              user when using OpenStack Identity API v3.
+:Type: String
+:Default: None
+
+
 .. _Architecture: ../../architecture#data-striping
 .. _Pool Configuration: ../../rados/configuration/pool-pg-config-ref/
 .. _Cluster Pools: ../../rados/operations/pools
 .. _Rados cluster handles: ../../rados/api/librados-intro/#step-2-configuring-a-cluster-handle
+.. _Barbican: ../barbican
+.. _Encryption: ../encryption

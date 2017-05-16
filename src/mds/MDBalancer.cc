@@ -12,6 +12,7 @@
  *
  */
 
+#include "include/compat.h"
 #include "mdstypes.h"
 
 #include "MDBalancer.h"
@@ -27,7 +28,6 @@
 #include "include/Context.h"
 #include "msg/Messenger.h"
 #include "messages/MHeartbeat.h"
-#include "messages/MMDSLoadTargets.h"
 
 #include <fstream>
 #include <iostream>
@@ -39,11 +39,21 @@ using std::vector;
 #include "common/config.h"
 #include "common/errno.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
-#undef DOUT_COND
-#define DOUT_COND(cct, l) l<=cct->_conf->debug_mds || l <= cct->_conf->debug_mds_balancer
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << mds->get_nodeid() << ".bal "
+#undef dout
+#define dout(lvl) \
+  do {\
+    auto subsys = ceph_subsys_mds;\
+    if ((dout_context)->_conf->subsys.should_gather(ceph_subsys_mds_balancer, lvl)) {\
+      subsys = ceph_subsys_mds_balancer;\
+    }\
+    dout_impl(dout_context, subsys, lvl) dout_prefix
+#undef dendl
+#define dendl dendl_impl; } while (0)
+
 
 #define MIN_LOAD    50   //  ??
 #define MIN_REEXPORT 5  // will automatically reexport
@@ -60,23 +70,70 @@ int MDBalancer::proc_message(Message *m)
     break;
 
   default:
-    derr << " balancer unknown message " << m->get_type() << dendl;
+    dout(0) << " balancer unknown message " << m->get_type() << dendl;
     assert(0 == "balancer unknown message");
   }
 
   return 0;
 }
 
+void MDBalancer::handle_export_pins(void)
+{
+  auto &q = mds->mdcache->export_pin_queue;
+  auto it = q.begin();
+  dout(20) << "export_pin_queue size=" << q.size() << dendl;
+  while (it != q.end()) {
+    auto current = it++;
+    CInode *in = *current;
+    assert(in->is_dir());
+    mds_rank_t export_pin = in->get_export_pin();
+    if (!in->is_exportable(export_pin)) {
+      dout(10) << "can no longer export " << *in << " because export pins have since changed" << dendl;
+      q.erase(current);
+      continue;
+    }
+    dout(10) << "exporting dirfrags of " << *in << " to " << export_pin << dendl;
+    bool has_auth = false;
+    list<frag_t> ls;
+    in->dirfragtree.get_leaves(ls);
+    for (const auto &fg : ls) {
+      CDir *cd = in->get_dirfrag(fg);
+      if (cd && cd->is_auth()) {
+        /* N.B. when we are no longer auth after exporting, this function will remove the inode from the queue */
+        mds->mdcache->migrator->export_dir(cd, export_pin);
+        has_auth = true;
+      }
+    }
+    if (!has_auth) {
+      dout(10) << "can no longer export " << *in << " because I am not auth for any dirfrags" << dendl;
+      q.erase(current);
+      continue;
+    }
+  }
 
-
+  set<CDir *> authsubs;
+  mds->mdcache->get_auth_subtrees(authsubs);
+  for (auto &cd : authsubs) {
+    mds_rank_t export_pin = cd->inode->get_export_pin();
+    dout(10) << "auth tree " << *cd << " export_pin=" << export_pin << dendl;
+    if (export_pin >= 0 && export_pin != mds->get_nodeid()) {
+      dout(10) << "exporting auth subtree " << *cd->inode << " to " << export_pin << dendl;
+      mds->mdcache->migrator->export_dir(cd, export_pin);
+    }
+  }
+}
 
 void MDBalancer::tick()
 {
   static int num_bal_times = g_conf->mds_bal_max;
-  static utime_t first = ceph_clock_now(g_ceph_context);
-  utime_t now = ceph_clock_now(g_ceph_context);
+  static utime_t first = ceph_clock_now();
+  utime_t now = ceph_clock_now();
   utime_t elapsed = now;
   elapsed -= first;
+
+  if (g_conf->mds_bal_export_pin) {
+    handle_export_pins();
+  }
 
   // sample?
   if ((double)now - (double)last_sample > g_conf->mds_bal_sample_interval) {
@@ -98,14 +155,6 @@ void MDBalancer::tick()
     send_heartbeat();
     num_bal_times--;
   }
-
-  // hash?
-  if ((g_conf->mds_bal_frag || g_conf->mds_thrash_fragments) &&
-      g_conf->mds_bal_fragment_interval > 0 &&
-      now.sec() - last_fragment.sec() > g_conf->mds_bal_fragment_interval) {
-    last_fragment = now;
-    do_fragmenting();
-  }
 }
 
 
@@ -114,7 +163,7 @@ void MDBalancer::tick()
 class C_Bal_SendHeartbeat : public MDSInternalContext {
 public:
   explicit C_Bal_SendHeartbeat(MDSRank *mds_) : MDSInternalContext(mds_) { }
-  virtual void finish(int f) {
+  void finish(int f) override {
     mds->balancer->send_heartbeat();
   }
 };
@@ -137,7 +186,7 @@ double mds_load_t::mds_load()
     return cpu_load_avg;
 
   }
-  assert(0);
+  ceph_abort();
   return 0;
 }
 
@@ -161,11 +210,11 @@ mds_load_t MDBalancer::get_load(utime_t now)
   load.req_rate = mds->get_req_rate();
   load.queue_len = messenger->get_dispatch_queue_len();
 
-  ifstream cpu("/proc/loadavg");
+  ifstream cpu(PROCPREFIX "/proc/loadavg");
   if (cpu.is_open())
     cpu >> load.cpu_load_avg;
   else
-    derr << "input file '/proc/loadavg' not found" << dendl;
+    dout(0) << "input file " PROCPREFIX "'/proc/loadavg' not found" << dendl;
   
   dout(15) << "get_load " << load << dendl;
   return load;
@@ -194,7 +243,7 @@ int MDBalancer::localize_balancer()
            << " oid=" << oid << " oloc=" << oloc << dendl;
 
   /* timeout: if we waste half our time waiting for RADOS, then abort! */
-  double t = ceph_clock_now(g_ceph_context) + g_conf->mds_bal_interval/2;
+  double t = ceph_clock_now() + g_conf->mds_bal_interval/2;
   utime_t timeout;
   timeout.set_from_double(t);
   lock.Lock();
@@ -216,9 +265,9 @@ int MDBalancer::localize_balancer()
 
 void MDBalancer::send_heartbeat()
 {
-  utime_t now = ceph_clock_now(g_ceph_context);
+  utime_t now = ceph_clock_now();
   
-  if (mds->mdsmap->is_degraded()) {
+  if (mds->is_cluster_degraded()) {
     dout(10) << "send_heartbeat degraded" << dendl;
     return;
   }
@@ -291,7 +340,7 @@ void MDBalancer::handle_heartbeat(MHeartbeat *m)
     return;
   }
 
-  if (mds->mdsmap->is_degraded()) {
+  if (mds->is_cluster_degraded()) {
     dout(10) << " degraded, ignoring" << dendl;
     goto out;
   }
@@ -301,7 +350,7 @@ void MDBalancer::handle_heartbeat(MHeartbeat *m)
     beat_epoch = m->get_beat();
     send_heartbeat();
 
-    show_imports();
+    mds->mdcache->show_subtrees();
   }
 
   {
@@ -344,14 +393,10 @@ void MDBalancer::export_empties()
 {
   dout(5) << "export_empties checking for empty imports" << dendl;
 
-  for (map<CDir*,set<CDir*> >::iterator it = mds->mdcache->subtrees.begin();
-       it != mds->mdcache->subtrees.end();
-       ++it) {
-    CDir *dir = it->first;
-    if (!dir->is_auth() ||
-	dir->is_ambiguous_auth() ||
-	dir->is_freezing() ||
-	dir->is_frozen())
+  std::set<CDir *> subtrees;
+  mds->mdcache->get_fullauth_subtrees(subtrees);
+  for (auto &dir : subtrees) {
+    if (dir->is_freezing() || dir->is_frozen())
       continue;
 
     if (!dir->inode->is_base() &&
@@ -363,7 +408,7 @@ void MDBalancer::export_empties()
 
 
 
-double MDBalancer::try_match(mds_rank_t ex, double& maxex,
+double MDBalancer::try_match(balance_state_t& state, mds_rank_t ex, double& maxex,
                              mds_rank_t im, double& maxim)
 {
   if (maxex <= 0 || maxim <= 0) return 0.0;
@@ -374,10 +419,10 @@ double MDBalancer::try_match(mds_rank_t ex, double& maxex,
   dout(5) << "   - mds." << ex << " exports " << howmuch << " to mds." << im << dendl;
 
   if (ex == mds->get_nodeid())
-    my_targets[im] += howmuch;
+    state.targets[im] += howmuch;
 
-  exported[ex] += howmuch;
-  imported[im] += howmuch;
+  state.exported[ex] += howmuch;
+  state.imported[im] += howmuch;
 
   maxex -= howmuch;
   maxim -= howmuch;
@@ -385,115 +430,140 @@ double MDBalancer::try_match(mds_rank_t ex, double& maxex,
   return howmuch;
 }
 
-void MDBalancer::queue_split(CDir *dir)
+void MDBalancer::queue_split(const CDir *dir, bool fast)
 {
+  dout(10) << __func__ << " enqueuing " << *dir
+                       << " (fast=" << fast << ")" << dendl;
+
   assert(mds->mdsmap->allows_dirfrags());
-  split_queue.insert(dir->dirfrag());
+  const dirfrag_t frag = dir->dirfrag();
+
+  auto callback = [this, frag](int r) {
+    if (split_pending.erase(frag) == 0) {
+      // Someone beat me to it.  This can happen in the fast splitting
+      // path, because we spawn two contexts, one with mds->timer and
+      // one with mds->queue_waiter.  The loser can safely just drop
+      // out.
+      return;
+    }
+
+    CDir *split_dir = mds->mdcache->get_dirfrag(frag);
+    if (!split_dir) {
+      dout(10) << "drop split on " << frag << " because not in cache" << dendl;
+      return;
+    }
+    if (!split_dir->is_auth()) {
+      dout(10) << "drop split on " << frag << " because non-auth" << dendl;
+      return;
+    }
+
+    // Pass on to MDCache: note that the split might still not
+    // happen if the checks in MDCache::can_fragment fail.
+    dout(10) << __func__ << " splitting " << *split_dir << dendl;
+    mds->mdcache->split_dir(split_dir, g_conf->mds_bal_split_bits);
+  };
+
+  bool is_new = false;
+  if (split_pending.count(frag) == 0) {
+    split_pending.insert(frag);
+    is_new = true;
+  }
+
+  if (fast) {
+    // Do the split ASAP: enqueue it in the MDSRank waiters which are
+    // run at the end of dispatching the current request
+    mds->queue_waiter(new MDSInternalContextWrapper(mds, 
+          new FunctionContext(callback)));
+  } else if (is_new) {
+    // Set a timer to really do the split: we don't do it immediately
+    // so that bursts of ops on a directory have a chance to go through
+    // before we freeze it.
+    mds->timer.add_event_after(g_conf->mds_bal_fragment_interval,
+                               new FunctionContext(callback));
+  }
 }
 
 void MDBalancer::queue_merge(CDir *dir)
 {
-  merge_queue.insert(dir->dirfrag());
-}
+  const auto frag = dir->dirfrag();
+  auto callback = [this, frag](int r) {
+    assert(frag.frag != frag_t());
 
-void MDBalancer::do_fragmenting()
-{
-  if (split_queue.empty() && merge_queue.empty()) {
-    dout(20) << "do_fragmenting has nothing to do" << dendl;
-    return;
-  }
+    // frag must be in this set because only one context is in flight
+    // for a given frag at a time (because merge_pending is checked before
+    // starting one), and this context is the only one that erases it.
+    merge_pending.erase(frag);
 
-  if (!split_queue.empty()) {
-    dout(10) << "do_fragmenting " << split_queue.size() << " dirs marked for possible splitting" << dendl;
-
-    set<dirfrag_t> q;
-    q.swap(split_queue);
-
-    for (set<dirfrag_t>::iterator i = q.begin();
-	 i != q.end();
-	 ++i) {
-      CDir *dir = mds->mdcache->get_dirfrag(*i);
-      if (!dir ||
-	  !dir->is_auth())
-	continue;
-
-      dout(10) << "do_fragmenting splitting " << *dir << dendl;
-      mds->mdcache->split_dir(dir, g_conf->mds_bal_split_bits);
+    CDir *dir = mds->mdcache->get_dirfrag(frag);
+    if (!dir) {
+      dout(10) << "drop merge on " << frag << " because not in cache" << dendl;
+      return;
     }
-  }
+    assert(dir->dirfrag() == frag);
 
-  if (!merge_queue.empty()) {
-    dout(10) << "do_fragmenting " << merge_queue.size() << " dirs marked for possible merging" << dendl;
+    if(!dir->is_auth()) {
+      dout(10) << "drop merge on " << *dir << " because lost auth" << dendl;
+      return;
+    }
 
-    set<dirfrag_t> q;
-    q.swap(merge_queue);
+    dout(10) << "merging " << *dir << dendl;
 
-    for (set<dirfrag_t>::iterator i = q.begin();
-	 i != q.end();
-	 ++i) {
-      CDir *dir = mds->mdcache->get_dirfrag(*i);
-      if (!dir ||
-	  !dir->is_auth() ||
-	  dir->get_frag() == frag_t())  // ok who's the joker?
-	continue;
+    CInode *diri = dir->get_inode();
 
-      dout(10) << "do_fragmenting merging " << *dir << dendl;
-
-      CInode *diri = dir->get_inode();
-
-      frag_t fg = dir->get_frag();
-      while (fg != frag_t()) {
-	frag_t sibfg = fg.get_sibling();
-	list<CDir*> sibs;
-	bool complete = diri->get_dirfrags_under(sibfg, sibs);
-	if (!complete) {
-	  dout(10) << "  not all sibs under " << sibfg << " in cache (have " << sibs << ")" << dendl;
-	  break;
-	}
-	bool all = true;
-	for (list<CDir*>::iterator p = sibs.begin(); p != sibs.end(); ++p) {
-	  CDir *sib = *p;
-	  if (!sib->is_auth() || !sib->should_merge()) {
-	    all = false;
-	    break;
-	  }
-	}
-	if (!all) {
-	  dout(10) << "  not all sibs under " << sibfg << " " << sibs << " should_merge" << dendl;
-	  break;
-	}
-	dout(10) << "  all sibs under " << sibfg << " " << sibs << " should merge" << dendl;
-	fg = fg.parent();
+    frag_t fg = dir->get_frag();
+    while (fg != frag_t()) {
+      frag_t sibfg = fg.get_sibling();
+      list<CDir*> sibs;
+      bool complete = diri->get_dirfrags_under(sibfg, sibs);
+      if (!complete) {
+        dout(10) << "  not all sibs under " << sibfg << " in cache (have " << sibs << ")" << dendl;
+        break;
       }
-
-      if (fg != dir->get_frag())
-	mds->mdcache->merge_dir(diri, fg);
+      bool all = true;
+      for (list<CDir*>::iterator p = sibs.begin(); p != sibs.end(); ++p) {
+        CDir *sib = *p;
+        if (!sib->is_auth() || !sib->should_merge()) {
+          all = false;
+          break;
+        }
+      }
+      if (!all) {
+        dout(10) << "  not all sibs under " << sibfg << " " << sibs << " should_merge" << dendl;
+        break;
+      }
+      dout(10) << "  all sibs under " << sibfg << " " << sibs << " should merge" << dendl;
+      fg = fg.parent();
     }
+
+    if (fg != dir->get_frag())
+      mds->mdcache->merge_dir(diri, fg);
+  };
+
+  if (merge_pending.count(frag) == 0) {
+    dout(20) << __func__ << " enqueued dir " << *dir << dendl;
+    merge_pending.insert(frag);
+    mds->timer.add_event_after(g_conf->mds_bal_fragment_interval,
+        new FunctionContext(callback));
+  } else {
+    dout(20) << __func__ << " dir already in queue " << *dir << dendl;
   }
 }
-
-
 
 void MDBalancer::prep_rebalance(int beat)
 {
+  balance_state_t state;
+
   if (g_conf->mds_thrash_exports) {
     //we're going to randomly export to all the mds in the cluster
-    my_targets.clear();
     set<mds_rank_t> up_mds;
     mds->get_mds_map()->get_up_mds_set(up_mds);
-    for (set<mds_rank_t>::iterator i = up_mds.begin();
-	 i != up_mds.end();
-	 ++i)
-      my_targets[*i] = 0.0;
+    for (const auto &rank : up_mds) {
+      state.targets[rank] = 0.0;
+    }
   } else {
     int cluster_size = mds->get_mds_map()->get_num_in_mds();
     mds_rank_t whoami = mds->get_nodeid();
-    rebalance_time = ceph_clock_now(g_ceph_context);
-
-    // reset
-    my_targets.clear();
-    imported.clear();
-    exported.clear();
+    rebalance_time = ceph_clock_now();
 
     dout(5) << " prep_rebalance: cluster loads are" << dendl;
 
@@ -515,7 +585,7 @@ void MDBalancer::prep_rebalance(int beat)
     double total_load = 0.0;
     multimap<double,mds_rank_t> load_map;
     for (mds_rank_t i=mds_rank_t(0); i < mds_rank_t(cluster_size); i++) {
-      map<mds_rank_t, mds_load_t>::value_type val(i, mds_load_t(ceph_clock_now(g_ceph_context)));
+      map<mds_rank_t, mds_load_t>::value_type val(i, mds_load_t(ceph_clock_now()));
       std::pair < map<mds_rank_t, mds_load_t>::iterator, bool > r(mds_load.insert(val));
       mds_load_t &load(r.first->second);
 
@@ -545,7 +615,7 @@ void MDBalancer::prep_rebalance(int beat)
     if (my_load < target_load * (1.0 + g_conf->mds_bal_min_rebalance)) {
       dout(5) << "  i am underloaded or barely overloaded, doing nothing." << dendl;
       last_epoch_under = beat_epoch;
-      show_imports();
+      mds->mdcache->show_subtrees();
       return;
     }
 
@@ -592,17 +662,16 @@ void MDBalancer::prep_rebalance(int beat)
       for (multimap<double,mds_rank_t>::reverse_iterator ex = exporters.rbegin();
 	   ex != exporters.rend();
 	   ++ex) {
-	double maxex = get_maxex(ex->second);
+	double maxex = get_maxex(state, ex->second);
 	if (maxex <= .001) continue;
 
 	// check importers. for now, just in arbitrary order (no intelligent matching).
 	for (map<mds_rank_t, float>::iterator im = mds_import_map[ex->second].begin();
 	     im != mds_import_map[ex->second].end();
 	     ++im) {
-	  double maxim = get_maxim(im->first);
+	  double maxim = get_maxim(state, im->first);
 	  if (maxim <= .001) continue;
-	  try_match(ex->second, maxex,
-		    im->first, maxim);
+	  try_match(state, ex->second, maxex, im->first, maxim);
 	  if (maxex <= .001) break;
 	}
       }
@@ -616,11 +685,10 @@ void MDBalancer::prep_rebalance(int beat)
       multimap<double,mds_rank_t>::iterator im = importers.begin();
       while (ex != exporters.rend() &&
 	     im != importers.end()) {
-        double maxex = get_maxex(ex->second);
-	double maxim = get_maxim(im->second);
+        double maxex = get_maxex(state, ex->second);
+	double maxim = get_maxim(state, im->second);
 	if (maxex < .001 || maxim < .001) break;
-	try_match(ex->second, maxex,
-		  im->second, maxim);
+	try_match(state, ex->second, maxex, im->second, maxim);
 	if (maxex <= .001) ++ex;
 	if (maxim <= .001) ++im;
       }
@@ -631,23 +699,31 @@ void MDBalancer::prep_rebalance(int beat)
       multimap<double,mds_rank_t>::iterator im = importers.begin();
       while (ex != exporters.end() &&
 	     im != importers.end()) {
-        double maxex = get_maxex(ex->second);
-	double maxim = get_maxim(im->second);
+        double maxex = get_maxex(state, ex->second);
+	double maxim = get_maxim(state, im->second);
 	if (maxex < .001 || maxim < .001) break;
-	try_match(ex->second, maxex,
-		  im->second, maxim);
+	try_match(state, ex->second, maxex, im->second, maxim);
 	if (maxex <= .001) ++ex;
 	if (maxim <= .001) ++im;
       }
     }
   }
-  try_rebalance();
+  try_rebalance(state);
 }
 
-
+void MDBalancer::hit_targets(const balance_state_t& state)
+{
+  utime_t now = ceph_clock_now();
+  for (auto &it : state.targets) {
+    mds_rank_t target = it.first;
+    mds->hit_export_target(now, target, g_conf->mds_bal_target_decay);
+  }
+}
 
 int MDBalancer::mantle_prep_rebalance()
 {
+  balance_state_t state;
+
   /* refresh balancer if it has changed */
   if (bal_version != mds->mdsmap->get_balancer()) {
     bal_version.assign("");
@@ -661,10 +737,7 @@ int MDBalancer::mantle_prep_rebalance()
 
   /* prepare for balancing */
   int cluster_size = mds->get_mds_map()->get_num_in_mds();
-  rebalance_time = ceph_clock_now(g_ceph_context);
-  my_targets.clear();
-  imported.clear();
-  exported.clear();
+  rebalance_time = ceph_clock_now();
   mds->mdcache->migrator->clear_export_queue();
 
   /* fill in the metrics for each mds by grabbing load struct */
@@ -672,7 +745,7 @@ int MDBalancer::mantle_prep_rebalance()
   for (mds_rank_t i=mds_rank_t(0);
        i < mds_rank_t(cluster_size);
        i++) {
-    map<mds_rank_t, mds_load_t>::value_type val(i, mds_load_t(ceph_clock_now(g_ceph_context)));
+    map<mds_rank_t, mds_load_t>::value_type val(i, mds_load_t(ceph_clock_now()));
     std::pair < map<mds_rank_t, mds_load_t>::iterator, bool > r(mds_load.insert(val));
     mds_load_t &load(r.first->second);
 
@@ -685,24 +758,24 @@ int MDBalancer::mantle_prep_rebalance()
 
   /* execute the balancer */
   Mantle mantle;
-  int ret = mantle.balance(bal_code, mds->get_nodeid(), metrics, my_targets);
-  dout(2) << " mantle decided that new targets=" << my_targets << dendl;
+  int ret = mantle.balance(bal_code, mds->get_nodeid(), metrics, state.targets);
+  dout(2) << " mantle decided that new targets=" << state.targets << dendl;
 
   /* mantle doesn't know about cluster size, so check target len here */
-  if ((int) my_targets.size() != cluster_size)
+  if ((int) state.targets.size() != cluster_size)
     return -EINVAL;
   else if (ret)
     return ret;
 
-  try_rebalance();
+  try_rebalance(state);
   return 0;
 }
 
 
 
-void MDBalancer::try_rebalance()
+void MDBalancer::try_rebalance(balance_state_t& state)
 {
-  if (!check_targets())
+  if (!check_targets(state))
     return;
 
   if (g_conf->mds_thrash_exports) {
@@ -746,11 +819,9 @@ void MDBalancer::try_rebalance()
   // do my exports!
   set<CDir*> already_exporting;
 
-  for (map<mds_rank_t,double>::iterator it = my_targets.begin();
-       it != my_targets.end();
-       ++it) {
-    mds_rank_t target = (*it).first;
-    double amount = (*it).second;
+  for (auto &it : state.targets) {
+    mds_rank_t target = it.first;
+    double amount = it.second;
 
     if (amount < MIN_OFFLOAD) continue;
     if (amount / target_load < .2) continue;
@@ -762,7 +833,7 @@ void MDBalancer::try_rebalance()
     double have = 0.0;
 
 
-    show_imports();
+    mds->mdcache->show_subtrees();
 
     // search imports from target
     if (import_from_map.count(target)) {
@@ -854,66 +925,19 @@ void MDBalancer::try_rebalance()
   }
 
   dout(5) << "rebalance done" << dendl;
-  show_imports();
+  mds->mdcache->show_subtrees();
 }
 
 
-/* returns true if all my_target MDS are in the MDSMap.
- */
-bool MDBalancer::check_targets()
+/* Check that all targets are in the MDSMap export_targets for my rank. */
+bool MDBalancer::check_targets(const balance_state_t& state)
 {
-  // get MonMap's idea of my_targets
-  const set<mds_rank_t>& map_targets = mds->mdsmap->get_mds_info(mds->get_nodeid()).export_targets;
-
-  bool send = false;
-  bool ok = true;
-
-  // make sure map targets are in the old_prev_targets map
-  for (set<mds_rank_t>::iterator p = map_targets.begin(); p != map_targets.end(); ++p) {
-    if (old_prev_targets.count(*p) == 0)
-      old_prev_targets[*p] = 0;
-    if (my_targets.count(*p) == 0)
-      old_prev_targets[*p]++;
-  }
-
-  // check if the current MonMap has all our targets
-  set<mds_rank_t> need_targets;
-  for (map<mds_rank_t,double>::iterator i = my_targets.begin();
-       i != my_targets.end();
-       ++i) {
-    need_targets.insert(i->first);
-    old_prev_targets[i->first] = 0;
-
-    if (!map_targets.count(i->first)) {
-      dout(20) << " target mds." << i->first << " not in map's export_targets" << dendl;
-      send = true;
-      ok = false;
+  for (const auto &it : state.targets) {
+    if (!mds->is_export_target(it.first)) {
+      return false;
     }
   }
-
-  set<mds_rank_t> want_targets = need_targets;
-  map<mds_rank_t, int>::iterator p = old_prev_targets.begin();
-  while (p != old_prev_targets.end()) {
-    if (map_targets.count(p->first) == 0 &&
-	need_targets.count(p->first) == 0) {
-      old_prev_targets.erase(p++);
-      continue;
-    }
-    dout(20) << " target mds." << p->first << " has been non-target for " << p->second << dendl;
-    if (p->second < g_conf->mds_bal_target_removal_min)
-      want_targets.insert(p->first);
-    if (p->second >= g_conf->mds_bal_target_removal_max)
-      send = true;
-    ++p;
-  }
-
-  dout(10) << "check_targets have " << map_targets << " need " << need_targets << " want " << want_targets << dendl;
-
-  if (send) {
-    MMDSLoadTargets* m = new MMDSLoadTargets(mds_gid_t(mon_client->get_global_id()), want_targets);
-    mon_client->send_mon_message(m);
-  }
-  return ok;
+  return true;
 }
 
 void MDBalancer::find_exports(CDir *dir,
@@ -1043,37 +1067,50 @@ void MDBalancer::hit_inode(utime_t now, CInode *in, int type, int who)
     hit_dir(now, in->get_parent_dn()->get_dir(), type, who);
 }
 
-void MDBalancer::hit_dir(utime_t now, CDir *dir, int type, int who, double amount)
+void MDBalancer::maybe_fragment(CDir *dir, bool hot)
 {
-  // hit me
-  double v = dir->pop_me.get(type).hit(now, amount);
-
   // split/merge
   if (g_conf->mds_bal_frag && g_conf->mds_bal_fragment_interval > 0 &&
       !dir->inode->is_base() &&        // not root/base (for now at least)
       dir->is_auth()) {
 
-    dout(20) << "hit_dir " << type << " pop is " << v << ", frag " << dir->get_frag()
-	     << " size " << dir->get_frag_size() << dendl;
-
     // split
     if (g_conf->mds_bal_split_size > 0 &&
 	mds->mdsmap->allows_dirfrags() &&
-	(dir->should_split() ||
-	 (v > g_conf->mds_bal_split_rd && type == META_POP_IRD) ||
-	 (v > g_conf->mds_bal_split_wr && type == META_POP_IWR)) &&
-	split_queue.count(dir->dirfrag()) == 0) {
-      dout(10) << "hit_dir " << type << " pop is " << v << ", putting in split_queue: " << *dir << dendl;
-      split_queue.insert(dir->dirfrag());
+	(dir->should_split() || hot))
+    {
+      if (split_pending.count(dir->dirfrag()) == 0) {
+        queue_split(dir, false);
+      } else {
+        if (dir->should_split_fast()) {
+          queue_split(dir, true);
+        } else {
+          dout(10) << __func__ << ": fragment already enqueued to split: "
+                   << *dir << dendl;
+        }
+      }
     }
 
     // merge?
     if (dir->get_frag() != frag_t() && dir->should_merge() &&
-	merge_queue.count(dir->dirfrag()) == 0) {
-      dout(10) << "hit_dir " << type << " pop is " << v << ", putting in merge_queue: " << *dir << dendl;
-      merge_queue.insert(dir->dirfrag());
+	merge_pending.count(dir->dirfrag()) == 0) {
+      queue_merge(dir);
     }
   }
+}
+
+void MDBalancer::hit_dir(utime_t now, CDir *dir, int type, int who, double amount)
+{
+  // hit me
+  double v = dir->pop_me.get(type).hit(now, amount);
+
+  const bool hot = (v > g_conf->mds_bal_split_rd && type == META_POP_IRD) ||
+                   (v > g_conf->mds_bal_split_wr && type == META_POP_IWR);
+
+  dout(20) << "hit_dir " << type << " pop is " << v << ", frag " << dir->get_frag()
+           << " size " << dir->get_frag_size() << dendl;
+
+  maybe_fragment(dir, hot);
 
   // replicate?
   if (type == META_POP_IRD && who >= 0) {
@@ -1193,12 +1230,3 @@ void MDBalancer::add_import(CDir *dir, utime_t now)
   }
 }
 
-
-
-
-
-
-void MDBalancer::show_imports(bool external)
-{
-  mds->mdcache->show_subtrees();
-}

@@ -4,13 +4,13 @@
 #include "librbd/operation/EnableFeaturesRequest.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "librbd/AioImageRequestWQ.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "librbd/Journal.h"
 #include "librbd/Utils.h"
 #include "librbd/image/SetFlagsRequest.h"
+#include "librbd/io/ImageRequestWQ.h"
 #include "librbd/journal/CreateRequest.h"
 #include "librbd/mirror/EnableRequest.h"
 #include "librbd/object_map/CreateRequest.h"
@@ -24,7 +24,7 @@ namespace operation {
 
 using util::create_async_context_callback;
 using util::create_context_callback;
-using util::create_rados_ack_callback;
+using util::create_rados_callback;
 
 template <typename I>
 EnableFeaturesRequest<I>::EnableFeaturesRequest(I &image_ctx,
@@ -91,7 +91,7 @@ void EnableFeaturesRequest<I>::send_block_writes() {
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
   RWLock::WLocker locker(image_ctx.owner_lock);
-  image_ctx.aio_work_queue->block_writes(create_context_callback<
+  image_ctx.io_work_queue->block_writes(create_context_callback<
     EnableFeaturesRequest<I>,
     &EnableFeaturesRequest<I>::handle_block_writes>(this));
 }
@@ -132,7 +132,7 @@ void EnableFeaturesRequest<I>::send_get_mirror_mode() {
 
   using klass = EnableFeaturesRequest<I>;
   librados::AioCompletion *comp =
-    create_rados_ack_callback<klass, &klass::handle_get_mirror_mode>(this);
+    create_rados_callback<klass, &klass::handle_get_mirror_mode>(this);
   m_out_bl.clear();
   int r = image_ctx.md_ctx.aio_operate(RBD_MIRRORING, comp, &op, &m_out_bl);
   assert(r == 0);
@@ -180,7 +180,8 @@ Context *EnableFeaturesRequest<I>::handle_get_mirror_mode(int *result) {
 
     if ((m_features & RBD_FEATURE_OBJECT_MAP) != 0) {
       if ((m_new_features & RBD_FEATURE_EXCLUSIVE_LOCK) == 0) {
-	lderr(cct) << "cannot enable object map" << dendl;
+	lderr(cct) << "cannot enable object-map. exclusive-lock must be "
+                      "enabled before enabling object-map." << dendl;
 	*result = -EINVAL;
 	break;
       }
@@ -189,7 +190,8 @@ Context *EnableFeaturesRequest<I>::handle_get_mirror_mode(int *result) {
     }
     if ((m_features & RBD_FEATURE_FAST_DIFF) != 0) {
       if ((m_new_features & RBD_FEATURE_OBJECT_MAP) == 0) {
-	lderr(cct) << "cannot enable fast diff" << dendl;
+	lderr(cct) << "cannot enable fast-diff. object-map must be "
+                      "enabled before enabling fast-diff." << dendl;
 	*result = -EINVAL;
 	break;
       }
@@ -198,7 +200,8 @@ Context *EnableFeaturesRequest<I>::handle_get_mirror_mode(int *result) {
     }
     if ((m_features & RBD_FEATURE_JOURNALING) != 0) {
       if ((m_new_features & RBD_FEATURE_EXCLUSIVE_LOCK) == 0) {
-	lderr(cct) << "cannot enable journaling" << dendl;
+	lderr(cct) << "cannot enable journaling. exclusive-lock must be "
+                      "enabled before enabling journaling." << dendl;
 	*result = -EINVAL;
 	break;
       }
@@ -337,7 +340,7 @@ void EnableFeaturesRequest<I>::send_set_features() {
 
   using klass = EnableFeaturesRequest<I>;
   librados::AioCompletion *comp =
-    create_rados_ack_callback<klass, &klass::handle_set_features>(this);
+    create_rados_callback<klass, &klass::handle_set_features>(this);
   int r = image_ctx.md_ctx.aio_operate(image_ctx.header_oid, comp, &op);
   assert(r == 0);
   comp->release();
@@ -468,7 +471,7 @@ Context *EnableFeaturesRequest<I>::handle_finish(int r) {
       image_ctx.exclusive_lock->unblock_requests();
     }
     if (m_writes_blocked) {
-      image_ctx.aio_work_queue->unblock_writes();
+      image_ctx.io_work_queue->unblock_writes();
     }
   }
   image_ctx.state->handle_prepare_lock_complete();

@@ -25,24 +25,25 @@ public:
                        RGWCompressionInfo* cs_info_, 
                        bool partial_content_,
                        RGWGetDataCB* next);
-  virtual ~RGWGetObj_Decompress() {}
+  ~RGWGetObj_Decompress() override {}
 
-  virtual int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) override;
-  virtual void fixup_range(off_t& ofs, off_t& end) override;
+  int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) override;
+  int fixup_range(off_t& ofs, off_t& end) override;
 
 };
 
 class RGWPutObj_Compress : public RGWPutObj_Filter
 {
   CephContext* cct;
-  bool compressed;
+  bool compressed{false};
+  CompressorRef compressor;
   std::vector<compression_block> blocks;
 public:
-  RGWPutObj_Compress(CephContext* cct_, RGWPutObjDataProcessor* next) :  RGWPutObj_Filter(next),
-                                                                         cct(cct_),
-                                                                         compressed(false) {}
-  virtual ~RGWPutObj_Compress(){}
-  virtual int handle_data(bufferlist& bl, off_t ofs, void **phandle, rgw_obj *pobj, bool *again) override;
+  RGWPutObj_Compress(CephContext* cct_, CompressorRef compressor,
+                     RGWPutObjDataProcessor* next)
+    : RGWPutObj_Filter(next), cct(cct_), compressor(compressor) {}
+  ~RGWPutObj_Compress() override{}
+  int handle_data(bufferlist& bl, off_t ofs, void **phandle, rgw_raw_obj *pobj, bool *again) override;
 
   bool is_compressed() { return compressed; }
   vector<compression_block>& get_compression_blocks() { return blocks; }

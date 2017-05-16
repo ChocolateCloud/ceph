@@ -153,6 +153,13 @@ class interval_set {
   };
 
   interval_set() : _size(0) {}
+  interval_set(std::map<T,T>& other) {
+    m.swap(other);
+    _size = 0;
+    for (auto& i : m) {
+      _size += i.second;
+    }
+  }
 
   int num_intervals() const
   {
@@ -234,7 +241,7 @@ class interval_set {
     return _size == other._size && m == other.m;
   }
 
-  int size() const {
+  int64_t size() const {
     return _size;
   }
 
@@ -356,7 +363,7 @@ class interval_set {
         
         if (p->first + p->second != start) {
           //cout << "p is " << p->first << "~" << p->second << ", start is " << start << ", len is " << len << endl;
-          assert(0);
+          ceph_abort();
         }
         
         p->second += len;               // append to end
@@ -499,6 +506,11 @@ class interval_set {
     swap(a);    
     union_of(a, b);
   }
+  void union_insert(T off, T len) {
+    interval_set a;
+    a.insert(off, len);
+    union_of(a);
+  }
 
   bool subset_of(const interval_set &big) const {
     for (typename std::map<T,T>::const_iterator i = m.begin();
@@ -543,6 +555,14 @@ class interval_set {
     }
   }
 
+  /*
+   * Move contents of m into another std::map<T,T>. Use that instead of
+   * encoding interval_set into bufferlist then decoding it back into std::map.
+   */
+  void move_into(std::map<T,T>& other) {
+    other = std::move(m);
+  }
+
 private:
   // data
   int64_t _size;
@@ -553,9 +573,9 @@ private:
 // want to include _nohead variants.
 template<typename T>
 struct denc_traits<interval_set<T>> {
-  enum { supported = true };
-  enum { bounded = false };
-  enum { featured = false };
+  static constexpr bool supported = true;
+  static constexpr bool bounded = false;
+  static constexpr bool featured = false;
   static void bound_encode(const interval_set<T>& v, size_t& p) {
     v.bound_encode(p);
   }

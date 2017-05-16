@@ -20,7 +20,6 @@
 #include "include/types.h"
 #include "include/xlist.h"
 
-#include <list>
 #include <map>
 using namespace std;
 #include "include/unordered_map.h"
@@ -49,18 +48,18 @@ class Processor {
   NetHandler net;
   Worker *worker;
   ServerSocket listen_socket;
-  uint64_t nonce;
   EventCallbackRef listen_handler;
 
   class C_processor_accept;
 
  public:
-  Processor(AsyncMessenger *r, Worker *w, CephContext *c, uint64_t n);
+  Processor(AsyncMessenger *r, Worker *w, CephContext *c);
   ~Processor() { delete listen_handler; };
 
   void stop();
-  int bind(const entity_addr_t &bind_addr, const set<int>& avoid_ports);
-  int rebind(const set<int>& avoid_port);
+  int bind(const entity_addr_t &bind_addr,
+	   const set<int>& avoid_ports,
+	   entity_addr_t* bound_addr);
   void start();
   void accept();
 };
@@ -83,25 +82,25 @@ public:
    * _nonce A unique ID to use for this AsyncMessenger. It should not
    * be a value that will be repeated if the daemon restarts.
    */
-  AsyncMessenger(CephContext *cct, entity_name_t name,
+  AsyncMessenger(CephContext *cct, entity_name_t name, const std::string &type,
                  string mname, uint64_t _nonce);
 
   /**
    * Destroy the AsyncMessenger. Pretty simple since all the work is done
    * elsewhere.
    */
-  virtual ~AsyncMessenger();
+  ~AsyncMessenger() override;
 
   /** @defgroup Accessors
    * @{
    */
   void set_addr_unknowns(const entity_addr_t &addr) override;
 
-  int get_dispatch_queue_len() {
+  int get_dispatch_queue_len() override {
     return dispatch_queue.get_queue_len();
   }
 
-  double get_dispatch_queue_max_age(utime_t now) {
+  double get_dispatch_queue_max_age(utime_t now) override {
     return dispatch_queue.get_max_age(now);
   }
   /** @} Accessors */
@@ -110,13 +109,14 @@ public:
    * @defgroup Configuration functions
    * @{
    */
-  void set_cluster_protocol(int p) {
+  void set_cluster_protocol(int p) override {
     assert(!started && !did_bind);
     cluster_protocol = p;
   }
 
-  int bind(const entity_addr_t& bind_addr);
-  int rebind(const set<int>& avoid_ports);
+  int bind(const entity_addr_t& bind_addr) override;
+  int rebind(const set<int>& avoid_ports) override;
+  int client_bind(const entity_addr_t& bind_addr) override;
 
   /** @} Configuration functions */
 
@@ -148,9 +148,8 @@ public:
    */
   ConnectionRef get_connection(const entity_inst_t& dest) override;
   ConnectionRef get_loopback_connection() override;
-  int send_keepalive(Connection *con);
-  virtual void mark_down(const entity_addr_t& addr) override;
-  virtual void mark_down_all() override {
+  void mark_down(const entity_addr_t& addr) override;
+  void mark_down_all() override {
     shutdown_connections(true);
   }
   /** @} // Connection Management */
@@ -211,6 +210,8 @@ private:
                       const entity_addr_t& dest_addr, int dest_type);
 
   int _send_message(Message *m, const entity_inst_t& dest);
+  void _finish_bind(const entity_addr_t& bind_addr,
+		    const entity_addr_t& listen_addr);
 
  private:
   static const uint64_t ReapDeadConnectionThreshold = 5;
@@ -223,6 +224,8 @@ private:
   // the worker run messenger's cron jobs
   Worker *local_worker;
 
+  std::string ms_type;
+
   /// overall lock used for AsyncMessenger data structures
   Mutex lock;
   // AsyncMessenger stuff
@@ -232,6 +235,17 @@ private:
   /// true, specifying we haven't learned our addr; set false when we find it.
   // maybe this should be protected by the lock?
   bool need_addr;
+
+  /**
+   * set to bind address if bind was called before NetworkStack was ready to
+   * bind
+   */
+  entity_addr_t pending_bind_addr;
+
+  /**
+   * false; set to true if a pending bind exists
+   */
+  bool pending_bind = false;
 
   /**
    *  The following aren't lock-protected since you shouldn't be able to race

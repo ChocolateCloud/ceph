@@ -47,7 +47,7 @@ public:
     ob->reads.push_back(&set_item);
   }
 
-  void finish(int r) {
+  void finish(int r) override {
     oc->bh_read_finish(poolid, oid, tid, start, length, bl, r, trust_enoent);
 
     // object destructor clears the list
@@ -68,7 +68,7 @@ class ObjectCacher::C_RetryRead : public Context {
 public:
   C_RetryRead(ObjectCacher *_oc, OSDRead *r, ObjectSet *os, Context *c)
     : oc(_oc), rd(r), oset(os), onfinish(c) {}
-  void finish(int r) {
+  void finish(int r) override {
     if (r < 0) {
       if (onfinish)
         onfinish->complete(r);
@@ -241,7 +241,7 @@ bool ObjectCacher::Object::is_cached(loff_t cur, loff_t left) const
       // gap
       return false;
     } else
-      assert(0);
+      ceph_abort();
   }
 
   return true;
@@ -320,7 +320,7 @@ int ObjectCacher::Object::map_read(ObjectExtent &ex,
         errors[cur] = e;
         ldout(oc->cct, 20) << "map_read error " << *e << dendl;
       } else {
-        assert(0);
+        ceph_abort();
       }
       
       loff_t lenfromcur = MIN(e->end() - cur, left);
@@ -349,7 +349,7 @@ int ObjectCacher::Object::map_read(ObjectExtent &ex,
       left -= MIN(left, n->length());
       continue;    // more?
     } else {
-      assert(0);
+      ceph_abort();
     }
   }
   return 0;
@@ -991,7 +991,7 @@ public:
     oc(c), poolid(_poolid), oid(o), tid(0) {
       ranges.swap(_ranges);
     }
-  void finish(int r) {
+  void finish(int r) override {
     oc->bh_write_commit(poolid, oid, ranges, tid, r);
   }
 };
@@ -1027,7 +1027,7 @@ void ObjectCacher::bh_write_scattered(list<BufferHead*>& blist)
     if (bh->snapc.seq > snapc.seq)
       snapc = bh->snapc;
     if (bh->last_write > last_write)
-      bh->last_write = bh->last_write;
+      last_write = bh->last_write;
   }
 
   C_WriteCommit *oncommit = new C_WriteCommit(this, ob->oloc.pool, ob->get_soid(), ranges);
@@ -1234,7 +1234,7 @@ void ObjectCacher::trim()
       break;
 
     ldout(cct, 10) << "trim trimming " << *bh << dendl;
-    assert(bh->is_clean() || bh->is_zero());
+    assert(bh->is_clean() || bh->is_zero() || bh->is_error());
 
     Object *ob = bh->ob;
     bh_remove(ob, bh);
@@ -1708,7 +1708,7 @@ class ObjectCacher::C_WaitForWrite : public Context {
 public:
   C_WaitForWrite(ObjectCacher *oc, uint64_t len, Context *onfinish) :
     m_oc(oc), m_len(len), m_onfinish(onfinish) {}
-  void finish(int r);
+  void finish(int r) override;
 private:
   ObjectCacher *m_oc;
   uint64_t m_len;
@@ -1850,7 +1850,7 @@ void ObjectCacher::flusher_entry()
     if (flusher_stop)
       break;
 
-    flusher_cond.WaitInterval(cct, lock, seconds(1));
+    flusher_cond.WaitInterval(lock, seconds(1));
   }
 
   /* Wait for reads to finish. This is only possible if handling
@@ -2435,7 +2435,7 @@ void ObjectCacher::verify_stats() const
 	  error += bh->length();
 	  break;
 	default:
-	  assert(0);
+	  ceph_abort();
 	}
       }
     }
@@ -2552,7 +2552,7 @@ void ObjectCacher::bh_set_state(BufferHead *bh, int s)
   }
 
   if (s != BufferHead::STATE_ERROR &&
-      bh->get_state() == BufferHead::STATE_ERROR) {
+      state == BufferHead::STATE_ERROR) {
     bh->error = 0;
   }
 

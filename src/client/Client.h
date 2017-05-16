@@ -252,14 +252,14 @@ class Client : public Dispatcher, public md_config_obs_t {
  public:
   using Dispatcher::cct;
 
-  PerfCounters *logger;
+  std::unique_ptr<PerfCounters> logger;
 
   class CommandHook : public AdminSocketHook {
     Client *m_client;
   public:
     explicit CommandHook(Client *client);
     bool call(std::string command, cmdmap_t &cmdmap, std::string format,
-	      bufferlist& out);
+	      bufferlist& out) override;
   };
   CommandHook m_command_hook;
 
@@ -304,8 +304,10 @@ public:
     return UserPerm(uid, gid);
   }
 protected:
-  MonClient *monclient;
   Messenger *messenger;  
+  MonClient *monclient;
+  Objecter  *objecter;
+
   client_t whoami;
 
   int user_id, group_id;
@@ -339,6 +341,7 @@ protected:
   MetaSession *_open_mds_session(mds_rank_t mds);
   void _close_mds_session(MetaSession *s);
   void _closed_mds_session(MetaSession *s);
+  bool _any_stale_sessions() const;
   void _kick_stale_sessions();
   void handle_client_session(MClientSession *m);
   void send_reconnect(MetaSession *s);
@@ -371,7 +374,7 @@ protected:
 			   int unless,int force=0);
   void encode_dentry_release(Dentry *dn, MetaRequest *req,
 			     mds_rank_t mds, int drop, int unless);
-  mds_rank_t choose_target_mds(MetaRequest *req);
+  mds_rank_t choose_target_mds(MetaRequest *req, Inode** phash_diri=NULL);
   void connect_mds_targets(mds_rank_t mds);
   void send_request(MetaRequest *request, MetaSession *session,
 		    bool drop_cap_releases=false);
@@ -383,7 +386,6 @@ protected:
   bool is_dir_operation(MetaRequest *request);
 
   bool   initialized;
-  bool   authenticated;
   bool   mounted;
   bool   unmounting;
 
@@ -400,13 +402,12 @@ protected:
 
 public:
   entity_name_t get_myname() { return messenger->get_myname(); } 
-  void sync_write_commit(InodeRef& in);
+  void _sync_write_commit(Inode *in);
 
 protected:
-  Filer                 *filer;     
-  ObjectCacher          *objectcacher;
-  Objecter              *objecter;     // (non-blocking) osd interface
-  WritebackHandler      *writeback_handler;
+  std::unique_ptr<Filer>             filer;
+  std::unique_ptr<ObjectCacher>      objectcacher;
+  std::unique_ptr<WritebackHandler>  writeback_handler;
 
   // cache
   ceph::unordered_map<vinodeno_t, Inode*> inode_map;
@@ -433,7 +434,7 @@ protected:
 
   // Optional extra metadata about me to send to the MDS
   std::map<std::string, std::string> metadata;
-  void populate_metadata();
+  void populate_metadata(const std::string &mount_root);
 
 
   /* async block write barrier support */
@@ -443,8 +444,7 @@ protected:
   SnapRealm *get_snap_realm_maybe(inodeno_t r);
   void put_snap_realm(SnapRealm *realm);
   bool adjust_realm_parent(SnapRealm *realm, inodeno_t parent);
-  inodeno_t update_snap_trace(bufferlist& bl, bool must_flush=true);
-  inodeno_t _update_snap_trace(vector<SnapRealmInfo>& trace);
+  void update_snap_trace(bufferlist& bl, SnapRealm **realm_ret, bool must_flush=true);
   void invalidate_snaprealm_and_children(SnapRealm *realm);
 
   Inode *open_snapdir(Inode *diri);
@@ -498,7 +498,6 @@ protected:
   friend class C_Client_DentryInvalidate;  // calls dentry_invalidate_cb
   friend class C_Block_Sync; // Calls block map and protected helpers
   friend class C_C_Tick; // Asserts on client_lock
-  friend class C_Client_SyncCommit; // Asserts on client_lock
   friend class C_Client_RequestInterrupt;
   friend class C_Client_Remount;
   friend void intrusive_ptr_release(Inode *in);
@@ -555,13 +554,13 @@ protected:
 
   // friends
   friend class SyntheticClient;
-  bool ms_dispatch(Message *m);
+  bool ms_dispatch(Message *m) override;
 
-  void ms_handle_connect(Connection *con);
-  bool ms_handle_reset(Connection *con);
-  void ms_handle_remote_reset(Connection *con);
-  bool ms_handle_refused(Connection *con);
-  bool ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bool force_new);
+  void ms_handle_connect(Connection *con) override;
+  bool ms_handle_reset(Connection *con) override;
+  void ms_handle_remote_reset(Connection *con) override;
+  bool ms_handle_refused(Connection *con) override;
+  bool ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bool force_new) override;
 
   int authenticate();
 
@@ -587,12 +586,19 @@ protected:
 
   void _close_sessions();
 
+  /**
+   * The basic housekeeping parts of init (perf counters, admin socket)
+   * that is independent of how objecters/monclient/messengers are
+   * being set up.
+   */
+  void _finish_init();
+
  public:
   void set_filer_flags(int flags);
   void clear_filer_flags(int flags);
 
-  Client(Messenger *m, MonClient *mc);
-  ~Client();
+  Client(Messenger *m, MonClient *mc, Objecter *objecter_);
+  ~Client() override;
   void tear_down_cache();
 
   void update_metadata(std::string const &k, std::string const &v);
@@ -602,8 +608,8 @@ protected:
   inodeno_t get_root_ino();
   Inode *get_root();
 
-  int init()  WARN_UNUSED_RESULT;
-  void shutdown();
+  virtual int init();
+  virtual void shutdown();
 
   // messaging
   void handle_mds_map(class MMDSMap *m);
@@ -663,7 +669,7 @@ protected:
   void wait_sync_caps(Inode *in, ceph_tid_t want);
   void wait_sync_caps(ceph_tid_t want);
   void queue_cap_snap(Inode *in, SnapContext &old_snapc);
-  void finish_cap_snap(Inode *in, CapSnap *capsnap, int used);
+  void finish_cap_snap(Inode *in, CapSnap &capsnap, int used);
   void _flushed_cap_snap(Inode *in, snapid_t seq);
 
   void _schedule_invalidate_dentry_callback(Dentry *dn, bool del);
@@ -738,6 +744,7 @@ private:
 
   // other helpers
   void _fragmap_remove_non_leaves(Inode *in);
+  void _fragmap_remove_stopped_mds(Inode *in, mds_rank_t mds);
 
   void _ll_get(Inode *in);
   int _ll_put(Inode *in, int num);
@@ -752,8 +759,8 @@ private:
     Client *client;
     Fh *f;
     C_Readahead(Client *c, Fh *f);
-    ~C_Readahead();
-    void finish(int r);
+    ~C_Readahead() override;
+    void finish(int r) override;
   };
 
   int _read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl, bool *checkeof);
@@ -805,6 +812,8 @@ private:
 		int flags, const UserPerm& perms);
   int _setxattr(InodeRef &in, const char *name, const void *value, size_t len,
 		int flags, const UserPerm& perms);
+  int _setxattr_check_data_pool(string& name, string& value, const OSDMap *osdmap);
+  void _setxattr_maybe_wait_for_osdmap(const char *name, const void *value, size_t len);
   int _removexattr(Inode *in, const char *nm, const UserPerm& perms);
   int _removexattr(InodeRef &in, const char *nm, const UserPerm& perms);
   int _open(Inode *in, int flags, mode_t mode, Fh **fhp,
@@ -857,8 +866,6 @@ private:
 
   int _getattr_for_perm(Inode *in, const UserPerm& perms);
   int _getgrouplist(gid_t **sgids, uid_t uid, gid_t gid);
-
-  int check_data_pool_exist(string name, string value, const OSDMap *osdmap);
 
   vinodeno_t _get_vino(Inode *in);
   inodeno_t _get_inodeno(Inode *in);
@@ -1220,9 +1227,24 @@ public:
   void ll_register_callbacks(struct client_callback_args *args);
   int test_dentry_handling(bool can_invalidate);
 
-  virtual const char** get_tracked_conf_keys() const;
-  virtual void handle_conf_change(const struct md_config_t *conf,
-	                          const std::set <std::string> &changed);
+  const char** get_tracked_conf_keys() const override;
+  void handle_conf_change(const struct md_config_t *conf,
+	                          const std::set <std::string> &changed) override;
+};
+
+/**
+ * Specialization of Client that manages its own Objecter instance
+ * and handles init/shutdown of messenger/monclient
+ */
+class StandaloneClient : public Client
+{
+  public:
+  StandaloneClient(Messenger *m, MonClient *mc);
+
+  ~StandaloneClient() override;
+
+  int init() override;
+  void shutdown() override;
 };
 
 #endif

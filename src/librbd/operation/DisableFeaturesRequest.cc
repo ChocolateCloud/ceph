@@ -5,13 +5,13 @@
 #include "common/dout.h"
 #include "common/errno.h"
 #include "cls/rbd/cls_rbd_client.h"
-#include "librbd/AioImageRequestWQ.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "librbd/Journal.h"
 #include "librbd/Utils.h"
 #include "librbd/image/SetFlagsRequest.h"
+#include "librbd/io/ImageRequestWQ.h"
 #include "librbd/journal/RemoveRequest.h"
 #include "librbd/mirror/DisableRequest.h"
 #include "librbd/object_map/RemoveRequest.h"
@@ -25,14 +25,16 @@ namespace operation {
 
 using util::create_async_context_callback;
 using util::create_context_callback;
-using util::create_rados_ack_callback;
+using util::create_rados_callback;
 
 template <typename I>
 DisableFeaturesRequest<I>::DisableFeaturesRequest(I &image_ctx,
                                                   Context *on_finish,
                                                   uint64_t journal_op_tid,
-                                                  uint64_t features)
-  : Request<I>(image_ctx, on_finish, journal_op_tid), m_features(features) {
+                                                  uint64_t features,
+                                                  bool force)
+  : Request<I>(image_ctx, on_finish, journal_op_tid), m_features(features),
+    m_force(force) {
 }
 
 template <typename I>
@@ -93,7 +95,7 @@ void DisableFeaturesRequest<I>::send_block_writes() {
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
   RWLock::WLocker locker(image_ctx.owner_lock);
-  image_ctx.aio_work_queue->block_writes(create_context_callback<
+  image_ctx.io_work_queue->block_writes(create_context_callback<
     DisableFeaturesRequest<I>,
     &DisableFeaturesRequest<I>::handle_block_writes>(this));
 }
@@ -144,7 +146,7 @@ void DisableFeaturesRequest<I>::send_acquire_exclusive_lock() {
 	!image_ctx.exclusive_lock->is_lock_owner()) {
       m_acquired_lock = true;
 
-      image_ctx.exclusive_lock->request_lock(ctx);
+      image_ctx.exclusive_lock->acquire_lock(ctx);
       return;
     }
   }
@@ -178,7 +180,9 @@ Context *DisableFeaturesRequest<I>::handle_acquire_exclusive_lock(int *result) {
     if ((m_features & RBD_FEATURE_EXCLUSIVE_LOCK) != 0) {
       if ((m_new_features & RBD_FEATURE_OBJECT_MAP) != 0 ||
           (m_new_features & RBD_FEATURE_JOURNALING) != 0) {
-        lderr(cct) << "cannot disable exclusive lock" << dendl;
+        lderr(cct) << "cannot disable exclusive-lock. object-map "
+                      "or journaling must be disabled before "
+                      "disabling exclusive-lock." << dendl;
         *result = -EINVAL;
         break;
       }
@@ -190,7 +194,8 @@ Context *DisableFeaturesRequest<I>::handle_acquire_exclusive_lock(int *result) {
     }
     if ((m_features & RBD_FEATURE_OBJECT_MAP) != 0) {
       if ((m_new_features & RBD_FEATURE_FAST_DIFF) != 0) {
-        lderr(cct) << "cannot disable object map" << dendl;
+        lderr(cct) << "cannot disable object-map. fast-diff must be "
+                      "disabled before disabling object-map." << dendl;
         *result = -EINVAL;
         break;
       }
@@ -223,7 +228,7 @@ void DisableFeaturesRequest<I>::send_get_mirror_mode() {
 
   using klass = DisableFeaturesRequest<I>;
   librados::AioCompletion *comp =
-    create_rados_ack_callback<klass, &klass::handle_get_mirror_mode>(this);
+    create_rados_callback<klass, &klass::handle_get_mirror_mode>(this);
   m_out_bl.clear();
   int r = image_ctx.md_ctx.aio_operate(RBD_MIRRORING, comp, &op, &m_out_bl);
   assert(r == 0);
@@ -271,7 +276,7 @@ void DisableFeaturesRequest<I>::send_get_mirror_image() {
 
   using klass = DisableFeaturesRequest<I>;
   librados::AioCompletion *comp =
-    create_rados_ack_callback<klass, &klass::handle_get_mirror_image>(this);
+    create_rados_callback<klass, &klass::handle_get_mirror_image>(this);
   m_out_bl.clear();
   int r = image_ctx.md_ctx.aio_operate(RBD_MIRRORING, comp, &op, &m_out_bl);
   assert(r == 0);
@@ -297,7 +302,7 @@ Context *DisableFeaturesRequest<I>::handle_get_mirror_image(int *result) {
     return handle_finish(*result);
   }
 
-  if (mirror_image.state == cls::rbd::MIRROR_IMAGE_STATE_ENABLED) {
+  if ((mirror_image.state == cls::rbd::MIRROR_IMAGE_STATE_ENABLED) && !m_force) {
     lderr(cct) << "cannot disable journaling: image mirroring "
                << "enabled and mirror pool mode set to image"
                << dendl;
@@ -321,7 +326,7 @@ void DisableFeaturesRequest<I>::send_disable_mirror_image() {
     &DisableFeaturesRequest<I>::handle_disable_mirror_image>(this);
 
   mirror::DisableRequest<I> *req =
-    mirror::DisableRequest<I>::create(&image_ctx, false, true, ctx);
+    mirror::DisableRequest<I>::create(&image_ctx, m_force, true, ctx);
   req->send();
 }
 
@@ -491,7 +496,7 @@ void DisableFeaturesRequest<I>::send_set_features() {
 
   using klass = DisableFeaturesRequest<I>;
   librados::AioCompletion *comp =
-    create_rados_ack_callback<klass, &klass::handle_set_features>(this);
+    create_rados_callback<klass, &klass::handle_set_features>(this);
   int r = image_ctx.md_ctx.aio_operate(image_ctx.header_oid, comp, &op);
   assert(r == 0);
   comp->release();
@@ -621,7 +626,7 @@ Context *DisableFeaturesRequest<I>::handle_finish(int r) {
       image_ctx.exclusive_lock->unblock_requests();
     }
 
-    image_ctx.aio_work_queue->unblock_writes();
+    image_ctx.io_work_queue->unblock_writes();
   }
   image_ctx.state->handle_prepare_lock_complete();
 

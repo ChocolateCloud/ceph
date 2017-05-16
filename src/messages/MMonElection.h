@@ -23,7 +23,7 @@
 class MMonElection : public Message {
 
   static const int HEAD_VERSION = 6;
-  static const int COMPAT_VERSION = 2;
+  static const int COMPAT_VERSION = 5;
 
 public:
   static const int OP_PROPOSE = 1;
@@ -36,7 +36,7 @@ public:
     case OP_ACK: return "ack";
     case OP_NAK: return "nak";
     case OP_VICTORY: return "victory";
-    default: assert(0); return 0;
+    default: ceph_abort(); return 0;
     }
   }
   
@@ -73,15 +73,15 @@ public:
     m->encode(monmap_bl, CEPH_FEATURES_ALL);
   }
 private:
-  ~MMonElection() {}
+  ~MMonElection() override {}
 
 public:  
-  const char *get_type_name() const { return "election"; }
-  void print(ostream& out) const {
+  const char *get_type_name() const override { return "election"; }
+  void print(ostream& out) const override {
     out << "election(" << fsid << " " << get_opname(op) << " " << epoch << ")";
   }
   
-  void encode_payload(uint64_t features) {
+  void encode_payload(uint64_t features) override {
     if (monmap_bl.length() && (features != CEPH_FEATURES_ALL)) {
       // reencode old-format monmap
       MonMap t;
@@ -101,26 +101,17 @@ public:
     ::encode(sharing_bl, payload);
     ::encode(mon_features, payload);
   }
-  void decode_payload() {
+  void decode_payload() override {
     bufferlist::iterator p = payload.begin();
-    if (header.version >= 2)
-      ::decode(fsid, p);
-    else
-      memset(&fsid, 0, sizeof(fsid));
+    ::decode(fsid, p);
     ::decode(op, p);
     ::decode(epoch, p);
     ::decode(monmap_bl, p);
     ::decode(quorum, p);
-    if (header.version >= 3)
-      ::decode(quorum_features, p);
-    else
-      quorum_features = 0;
-    if (header.version >= 4) {
-      ::decode(defunct_one, p);
-      ::decode(defunct_two, p);
-    }
-    if (header.version >= 5)
-      ::decode(sharing_bl, p);
+    ::decode(quorum_features, p);
+    ::decode(defunct_one, p);
+    ::decode(defunct_two, p);
+    ::decode(sharing_bl, p);
     if (header.version >= 6)
       ::decode(mon_features, p);
   }

@@ -1,4 +1,4 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -7,9 +7,9 @@
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
- * License version 2.1, as published by the Free Software 
+ * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- * 
+ *
  */
 
 #include "common/debug.h"
@@ -18,6 +18,7 @@
 
 #include "DamageTable.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << rank << ".damage " << __func__ << " "
@@ -37,18 +38,19 @@ class DirFragDamage : public DamageEntry
     : ino(ino_), frag(frag_)
   {}
 
-  virtual damage_entry_type_t get_type() const
+  damage_entry_type_t get_type() const override
   {
     return DAMAGE_ENTRY_DIRFRAG;
   }
 
-  void dump(Formatter *f) const
+  void dump(Formatter *f) const override
   {
     f->open_object_section("dir_frag_damage");
     f->dump_string("damage_type", "dir_frag");
     f->dump_int("id", id);
     f->dump_int("ino", ino);
     f->dump_stream("frag") << frag;
+    f->dump_string("path", path);
     f->close_section();
   }
 };
@@ -73,12 +75,12 @@ class DentryDamage : public DamageEntry
     : ino(ino_), frag(frag_), dname(dname_), snap_id(snap_id_)
   {}
 
-  virtual damage_entry_type_t get_type() const
+  damage_entry_type_t get_type() const override
   {
     return DAMAGE_ENTRY_DENTRY;
   }
 
-  void dump(Formatter *f) const
+  void dump(Formatter *f) const override
   {
     f->open_object_section("dentry_damage");
     f->dump_string("damage_type", "dentry");
@@ -87,6 +89,7 @@ class DentryDamage : public DamageEntry
     f->dump_stream("frag") << frag;
     f->dump_string("dname", dname);
     f->dump_stream("snap_id") << snap_id;
+    f->dump_string("path", path);
     f->close_section();
   }
 };
@@ -104,17 +107,18 @@ class BacktraceDamage : public DamageEntry
     : ino(ino_)
   {}
 
-  virtual damage_entry_type_t get_type() const
+  damage_entry_type_t get_type() const override
   {
     return DAMAGE_ENTRY_BACKTRACE;
   }
 
-  void dump(Formatter *f) const
+  void dump(Formatter *f) const override
   {
     f->open_object_section("backtrace_damage");
     f->dump_string("damage_type", "backtrace");
     f->dump_int("id", id);
     f->dump_int("ino", ino);
+    f->dump_string("path", path);
     f->close_section();
   }
 };
@@ -125,7 +129,7 @@ DamageEntry::~DamageEntry()
 
 bool DamageTable::notify_dentry(
     inodeno_t ino, frag_t frag,
-    snapid_t snap_id, const std::string &dname)
+    snapid_t snap_id, const std::string &dname, const std::string &path)
 {
   if (oversized()) {
     return true;
@@ -147,6 +151,7 @@ bool DamageTable::notify_dentry(
   if (dentries.count(key) == 0) {
     DamageEntryRef entry = std::make_shared<DentryDamage>(
         ino, frag, dname, snap_id);
+    entry->path = path;
     dentries[key][DentryIdent(dname, snap_id)] = entry;
     by_id[entry->id] = std::move(entry);
   }
@@ -154,7 +159,8 @@ bool DamageTable::notify_dentry(
   return false;
 }
 
-bool DamageTable::notify_dirfrag(inodeno_t ino, frag_t frag)
+bool DamageTable::notify_dirfrag(inodeno_t ino, frag_t frag,
+                                 const std::string &path)
 {
   // Special cases: damage to these dirfrags is considered fatal to
   // the MDS rank that owns them.
@@ -175,6 +181,7 @@ bool DamageTable::notify_dirfrag(inodeno_t ino, frag_t frag)
   auto key = DirFragIdent(ino, frag);
   if (dirfrags.count(key) == 0) {
     DamageEntryRef entry = std::make_shared<DirFragDamage>(ino, frag);
+    entry->path = path;
     dirfrags[key] = entry;
     by_id[entry->id] = std::move(entry);
   }
@@ -182,7 +189,7 @@ bool DamageTable::notify_dirfrag(inodeno_t ino, frag_t frag)
   return false;
 }
 
-bool DamageTable::notify_remote_damaged(inodeno_t ino)
+bool DamageTable::notify_remote_damaged(inodeno_t ino, const std::string &path)
 {
   if (oversized()) {
     return true;
@@ -190,6 +197,7 @@ bool DamageTable::notify_remote_damaged(inodeno_t ino)
 
   if (remotes.count(ino) == 0) {
     auto entry = std::make_shared<BacktraceDamage>(ino);
+    entry->path = path;
     remotes[ino] = entry;
     by_id[entry->id] = std::move(entry);
   }
@@ -264,7 +272,7 @@ void DamageTable::erase(damage_entry_id_t damage_id)
     remotes.erase(backtrace_entry->ino);
   } else {
     derr << "Invalid type " << type << dendl;
-    assert(0);
+    ceph_abort();
   }
 
   by_id.erase(by_id_entry);

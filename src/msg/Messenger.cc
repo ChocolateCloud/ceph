@@ -2,7 +2,9 @@
 // vim: ts=8 sw=2 smarttab
 
 #include <random>
+#include <netdb.h>
 #include "include/Spinlock.h"
+
 #include "include/types.h"
 #include "Messenger.h"
 
@@ -14,10 +16,11 @@
 
 Messenger *Messenger::create_client_messenger(CephContext *cct, string lname)
 {
+  std::string public_msgr_type = cct->_conf->ms_public_type.empty() ? cct->_conf->get_val<std::string>("ms_type") : cct->_conf->ms_public_type;
   uint64_t nonce = 0;
   get_random_bytes((char*)&nonce, sizeof(nonce));
-  return Messenger::create(cct, cct->_conf->ms_type, entity_name_t::CLIENT(),
-			   lname, nonce, 0);
+  return Messenger::create(cct, public_msgr_type, entity_name_t::CLIENT(),
+			   std::move(lname), nonce, 0);
 }
 
 Messenger *Messenger::create(CephContext *cct, const string &type,
@@ -35,16 +38,37 @@ Messenger *Messenger::create(CephContext *cct, const string &type,
     r = dis(random_engine);
   }
   if (r == 0 || type == "simple")
-    return new SimpleMessenger(cct, name, lname, nonce);
-  else if (r == 1 || type == "async")
-    return new AsyncMessenger(cct, name, lname, nonce);
+    return new SimpleMessenger(cct, name, std::move(lname), nonce);
+  else if (r == 1 || type.find("async") != std::string::npos)
+    return new AsyncMessenger(cct, name, type, std::move(lname), nonce);
 #ifdef HAVE_XIO
   else if ((type == "xio") &&
 	   cct->check_experimental_feature_enabled("ms-type-xio"))
-    return new XioMessenger(cct, name, lname, nonce, cflags);
+    return new XioMessenger(cct, name, std::move(lname), nonce, cflags);
 #endif
   lderr(cct) << "unrecognized ms_type '" << type << "'" << dendl;
   return nullptr;
+}
+
+void Messenger::set_endpoint_addr(const entity_addr_t& a,
+                                  const entity_name_t &name)
+{
+  size_t hostlen;
+  if (a.get_family() == AF_INET)
+    hostlen = sizeof(struct sockaddr_in);
+  else if (a.get_family() == AF_INET6)
+    hostlen = sizeof(struct sockaddr_in6);
+  else
+    hostlen = 0;
+
+  if (hostlen) {
+    char buf[NI_MAXHOST] = { 0 };
+    getnameinfo(a.get_sockaddr(), hostlen, buf, sizeof(buf),
+                NULL, 0, NI_NUMERICHOST);
+
+    trace_endpoint.copy_ip(buf);
+  }
+  trace_endpoint.set_port(a.get_port());
 }
 
 /*

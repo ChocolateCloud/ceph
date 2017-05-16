@@ -14,6 +14,7 @@ method.
 # Copyright 2016 Mehdi Abaakouk <sileht@redhat.com>
 
 from cpython cimport PyObject, ref
+from cpython.pycapsule cimport *
 from libc cimport errno
 from libc.stdint cimport *
 from libc.stdlib cimport malloc, realloc, free
@@ -28,9 +29,7 @@ from functools import partial, wraps
 from itertools import chain
 
 # Are we running Python 2.x
-_python2 = sys.hexversion < 0x03000000
-
-if _python2:
+if sys.version_info[0] < 3:
     str_type = basestring
 else:
     str_type = str
@@ -126,6 +125,7 @@ cdef extern from "rados/librados.h" nogil:
     void rados_version(int *major, int *minor, int *extra)
     int rados_create2(rados_t *pcluster, const char *const clustername,
                       const char * const name, uint64_t flags)
+    int rados_create_with_context(rados_t *cluster, rados_config_t cct)
     int rados_connect(rados_t cluster)
     void rados_shutdown(rados_t cluster)
     int rados_conf_read_file(rados_t cluster, const char *path)
@@ -243,6 +243,8 @@ cdef extern from "rados/librados.h" nogil:
 
     int rados_exec(rados_ioctx_t io, const char * oid, const char * cls, const char * method,
                    const char * in_buf, size_t in_len, char * buf, size_t out_len)
+    int rados_aio_exec(rados_ioctx_t io, const char * oid, rados_completion_t completion, const char * cls, const char * method,
+                       const char * in_buf, size_t in_len, char * buf, size_t out_len)
 
     int rados_write_op_operate(rados_write_op_t write_op, rados_ioctx_t io, const char * oid, time_t * mtime, int flags)
     int rados_aio_write_op_operate(rados_write_op_t write_op, rados_ioctx_t io, rados_completion_t completion, const char *oid, time_t *mtime, int flags)
@@ -295,59 +297,68 @@ LIBRADOS_CREATE_IDEMPOTENT = _LIBRADOS_CREATE_IDEMPOTENT
 ANONYMOUS_AUID = 0xffffffffffffffff
 ADMIN_AUID = 0
 
+
 class Error(Exception):
     """ `Error` class, derived from `Exception` """
-
-
-class InvalidArgument(Error):
     pass
 
 
-class InterruptedOrTimeoutError(Error):
-    """ `InterruptedOrTimeoutError` class, derived from `Error` """
+class InvalidArgumentError(Error):
     pass
 
 
-class PermissionError(Error):
-    """ `PermissionError` class, derived from `Error` """
+class OSError(Error):
+    """ `OSError` class, derived from `Error` """
+    def __init__(self, errno, strerror):
+        self.errno = errno
+        self.strerror = strerror
+
+    def __str__(self):
+        return '[Errno {0}] {1}'.format(self.errno, self.strerror)
+
+
+class InterruptedOrTimeoutError(OSError):
+    """ `InterruptedOrTimeoutError` class, derived from `OSError` """
     pass
 
-class PermissionDeniedError(Error):
+
+class PermissionError(OSError):
+    """ `PermissionError` class, derived from `OSError` """
+    pass
+
+
+class PermissionDeniedError(OSError):
     """ deal with EACCES related. """
     pass
 
-class ObjectNotFound(Error):
-    """ `ObjectNotFound` class, derived from `Error` """
+
+class ObjectNotFound(OSError):
+    """ `ObjectNotFound` class, derived from `OSError` """
     pass
 
 
-class NoData(Error):
-    """ `NoData` class, derived from `Error` """
+class NoData(OSError):
+    """ `NoData` class, derived from `OSError` """
     pass
 
 
-class ObjectExists(Error):
-    """ `ObjectExists` class, derived from `Error` """
+class ObjectExists(OSError):
+    """ `ObjectExists` class, derived from `OSError` """
     pass
 
 
-class ObjectBusy(Error):
-    """ `ObjectBusy` class, derived from `Error` """
+class ObjectBusy(OSError):
+    """ `ObjectBusy` class, derived from `IOError` """
     pass
 
 
-class IOError(Error):
-    """ `IOError` class, derived from `Error` """
+class IOError(OSError):
+    """ `ObjectBusy` class, derived from `OSError` """
     pass
 
 
-class NoSpace(Error):
-    """ `NoSpace` class, derived from `Error` """
-    pass
-
-
-class IncompleteWriteError(Error):
-    """ `IncompleteWriteError` class, derived from `Error` """
+class NoSpace(OSError):
+    """ `NoSpace` class, derived from `OSError` """
     pass
 
 
@@ -360,6 +371,7 @@ class IoctxStateError(Error):
     """ `IoctxStateError` class, derived from `Error` """
     pass
 
+
 class ObjectStateError(Error):
     """ `ObjectStateError` class, derived from `Error` """
     pass
@@ -370,24 +382,39 @@ class LogicError(Error):
     pass
 
 
-class TimedOut(Error):
-    """ `TimedOut` class, derived from `Error` """
+class TimedOut(OSError):
+    """ `TimedOut` class, derived from `OSError` """
     pass
 
 
-
-cdef errno_to_exception = {
-    errno.EPERM     : PermissionError,
-    errno.ENOENT    : ObjectNotFound,
-    errno.EIO       : IOError,
-    errno.ENOSPC    : NoSpace,
-    errno.EEXIST    : ObjectExists,
-    errno.EBUSY     : ObjectBusy,
-    errno.ENODATA   : NoData,
-    errno.EINTR     : InterruptedOrTimeoutError,
-    errno.ETIMEDOUT : TimedOut,
-    errno.EACCES    : PermissionDeniedError
-}
+IF UNAME_SYSNAME == "FreeBSD":
+    cdef errno_to_exception = {
+        errno.EPERM     : PermissionError,
+        errno.ENOENT    : ObjectNotFound,
+        errno.EIO       : IOError,
+        errno.ENOSPC    : NoSpace,
+        errno.EEXIST    : ObjectExists,
+        errno.EBUSY     : ObjectBusy,
+        errno.ENOATTR   : NoData,
+        errno.EINTR     : InterruptedOrTimeoutError,
+        errno.ETIMEDOUT : TimedOut,
+        errno.EACCES    : PermissionDeniedError,
+        errno.EINVAL    : InvalidArgumentError,
+    }
+ELSE:
+    cdef errno_to_exception = {
+        errno.EPERM     : PermissionError,
+        errno.ENOENT    : ObjectNotFound,
+        errno.EIO       : IOError,
+        errno.ENOSPC    : NoSpace,
+        errno.EEXIST    : ObjectExists,
+        errno.EBUSY     : ObjectBusy,
+        errno.ENODATA   : NoData,
+        errno.EINTR     : InterruptedOrTimeoutError,
+        errno.ETIMEDOUT : TimedOut,
+        errno.EACCES    : PermissionDeniedError,
+        errno.EINVAL    : InvalidArgumentError,
+    }
 
 
 cdef make_ex(ret, msg):
@@ -402,9 +429,9 @@ cdef make_ex(ret, msg):
     """
     ret = abs(ret)
     if ret in errno_to_exception:
-        return errno_to_exception[ret](msg)
+        return errno_to_exception[ret](ret, msg)
     else:
-        return Error(msg + (": error code %d" % ret))
+        return Error(ret, msg + (": error code %d" % ret))
 
 
 # helper to specify an optional argument, where in addition to `cls`, `None`
@@ -551,7 +578,8 @@ cdef class Rados(object):
     @requires(('rados_id', opt(str_type)), ('name', opt(str_type)), ('clustername', opt(str_type)),
               ('conffile', opt(str_type)))
     def __setup(self, rados_id=None, name=None, clustername=None,
-                conf_defaults=None, conffile=None, conf=None, flags=0):
+                conf_defaults=None, conffile=None, conf=None, flags=0,
+                context=None):
         self.monitor_callback = None
         self.parsed_args = []
         self.conf_defaults = conf_defaults
@@ -575,8 +603,14 @@ cdef class Rados(object):
             int _flags = flags
             int ret
 
-        with nogil:
-            ret = rados_create2(&self.cluster, _clustername, _name, _flags)
+        if context:
+            # Unpack void* (aka rados_config_t) from capsule
+            rados_config = <rados_config_t> PyCapsule_GetPointer(context, NULL)
+            with nogil:
+                ret = rados_create_with_context(&self.cluster, rados_config)
+        else:
+            with nogil:
+                ret = rados_create2(&self.cluster, _clustername, _name, _flags)
         if ret != 0:
             raise Error("rados_initialize failed with error code: %d" % ret)
 
@@ -1990,6 +2024,7 @@ cdef class Ioctx(object):
         completion_obj.rados_comp = completion
         return completion_obj
 
+    @requires(('object_name', str_type), ('oncomplete', opt(Callable)))
     def aio_stat(self, object_name, oncomplete):
         """
         Asynchronously get object stats (size/mtime)
@@ -2035,6 +2070,8 @@ cdef class Ioctx(object):
             raise make_ex(ret, "error stating %s" % object_name)
         return completion
 
+    @requires(('object_name', str_type), ('to_write', bytes), ('offset', int),
+              ('oncomplete', opt(Callable)), ('onsafe', opt(Callable)))
     def aio_write(self, object_name, to_write, offset=0,
                   oncomplete=None, onsafe=None):
         """
@@ -2078,6 +2115,8 @@ cdef class Ioctx(object):
             raise make_ex(ret, "error writing object %s" % object_name)
         return completion
 
+    @requires(('object_name', str_type), ('to_write', bytes), ('oncomplete', opt(Callable)),
+              ('onsafe', opt(Callable)))
     def aio_write_full(self, object_name, to_write,
                        oncomplete=None, onsafe=None):
         """
@@ -2121,6 +2160,8 @@ cdef class Ioctx(object):
             raise make_ex(ret, "error writing object %s" % object_name)
         return completion
 
+    @requires(('object_name', str_type), ('to_append', bytes), ('oncomplete', opt(Callable)),
+              ('onsafe', opt(Callable)))
     def aio_append(self, object_name, to_append, oncomplete=None, onsafe=None):
         """
         Asychronously append data to an object
@@ -2173,6 +2214,8 @@ cdef class Ioctx(object):
         if ret < 0:
             raise make_ex(ret, "error flushing")
 
+    @requires(('object_name', str_type), ('length', int), ('offset', int),
+              ('oncomplete', opt(Callable)))
     def aio_read(self, object_name, length, offset, oncomplete):
         """
         Asychronously read data from an object
@@ -2224,6 +2267,78 @@ cdef class Ioctx(object):
             raise make_ex(ret, "error reading %s" % object_name)
         return completion
 
+    @requires(('object_name', str_type), ('cls', str_type), ('method', str_type),
+              ('data', bytes), ('length', int),
+              ('oncomplete', opt(Callable)), ('onsafe', opt(Callable)))
+    def aio_execute(self, object_name, cls, method, data,
+                    length=8192, oncomplete=None, onsafe=None):
+        """
+        Asynchronously execute an OSD class method on an object.
+
+        oncomplete and onsafe will be called with the data returned from
+        the plugin as well as the completion:
+
+        oncomplete(completion, data)
+        onsafe(completion, data)
+
+        :param object_name: name of the object
+        :type object_name: str
+        :param cls: name of the object class
+        :type cls: str
+        :param method: name of the method
+        :type method: str
+        :param data: input data
+        :type data: bytes
+        :param length: size of output buffer in bytes (default=8192)
+        :type length: int
+        :param oncomplete: what to do when the execution is complete
+        :type oncomplete: completion
+        :param onsafe:  what to do when the execution is safe and complete
+        :type onsafe: completion
+
+        :raises: :class:`Error`
+        :returns: completion object
+        """
+
+        object_name = cstr(object_name, 'object_name')
+        cls = cstr(cls, 'cls')
+        method = cstr(method, 'method')
+        cdef:
+            Completion completion
+            char *_object_name = object_name
+            char *_cls = cls
+            char *_method = method
+            char *_data = data
+            size_t _data_len = len(data)
+
+            char *ref_buf
+            size_t _length = length
+
+        def oncomplete_(completion_v):
+            cdef Completion _completion_v = completion_v
+            return_value = _completion_v.get_return_value()
+            if return_value > 0 and return_value != length:
+                _PyBytes_Resize(&_completion_v.buf, return_value)
+            return oncomplete(_completion_v, <object>_completion_v.buf if return_value >= 0 else None)
+
+        def onsafe_(completion_v):
+            cdef Completion _completion_v = completion_v
+            return_value = _completion_v.get_return_value()
+            return onsafe(_completion_v, <object>_completion_v.buf if return_value >= 0 else None)
+
+        completion = self.__get_completion(oncomplete_ if oncomplete else None, onsafe_ if onsafe else None)
+        completion.buf = PyBytes_FromStringAndSize(NULL, length)
+        ret_buf = PyBytes_AsString(completion.buf)
+        self.__track_completion(completion)
+        with nogil:
+            ret = rados_aio_exec(self.io, _object_name, completion.rados_comp,
+                                 _cls, _method, _data, _data_len, ret_buf, _length)
+        if ret < 0:
+            completion._cleanup()
+            raise make_ex(ret, "error executing %s::%s on %s" % (cls, method, object_name))
+        return completion
+
+    @requires(('object_name', str_type), ('oncomplete', opt(Callable)), ('onsafe', opt(Callable)))
     def aio_remove(self, object_name, oncomplete=None, onsafe=None):
         """
         Asychronously remove an object
@@ -2541,7 +2656,7 @@ returned %d, but should return zero on success." % (self.name, ret))
         :type method: str
         :param data: input data
         :type data: bytes
-        :param length: size of output buffer in bytes (default=8291)
+        :param length: size of output buffer in bytes (default=8192)
         :type length: int
 
         :raises: :class:`TypeError`

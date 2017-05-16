@@ -2,10 +2,11 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "cls/rbd/cls_rbd_types.h"
-#include "librbd/WatchNotifyTypes.h"
+#include "common/Formatter.h"
 #include "include/assert.h"
 #include "include/stringify.h"
-#include "common/Formatter.h"
+#include "librbd/WatchNotifyTypes.h"
+#include "librbd/watcher/Utils.h"
 
 namespace librbd {
 namespace watch_notify {
@@ -18,35 +19,6 @@ public:
   inline bool operator()(const Payload &payload) const {
     return Payload::CHECK_FOR_REFRESH;
   }
-};
-
-class EncodePayloadVisitor : public boost::static_visitor<void> {
-public:
-  explicit EncodePayloadVisitor(bufferlist &bl) : m_bl(bl) {}
-
-  template <typename Payload>
-  inline void operator()(const Payload &payload) const {
-    ::encode(static_cast<uint32_t>(Payload::NOTIFY_OP), m_bl);
-    payload.encode(m_bl);
-  }
-
-private:
-  bufferlist &m_bl;
-};
-
-class DecodePayloadVisitor : public boost::static_visitor<void> {
-public:
-  DecodePayloadVisitor(__u8 version, bufferlist::iterator &iter)
-    : m_version(version), m_iter(iter) {}
-
-  template <typename Payload>
-  inline void operator()(Payload &payload) const {
-    payload.decode(m_version, m_iter);
-  }
-
-private:
-  __u8 m_version;
-  bufferlist::iterator &m_iter;
 };
 
 class DumpPayloadVisitor : public boost::static_visitor<void> {
@@ -64,22 +36,7 @@ private:
   ceph::Formatter *m_formatter;
 };
 
-}
-
-void ClientId::encode(bufferlist &bl) const {
-  ::encode(gid, bl);
-  ::encode(handle, bl);
-}
-
-void ClientId::decode(bufferlist::iterator &iter) {
-  ::decode(gid, iter);
-  ::decode(handle, iter);
-}
-
-void ClientId::dump(Formatter *f) const {
-  f->dump_unsigned("gid", gid);
-  f->dump_unsigned("handle", handle);
-}
+} // anonymous namespace
 
 void AsyncRequestId::encode(bufferlist &bl) const {
   ::encode(client_id, bl);
@@ -208,14 +165,14 @@ void AsyncCompletePayload::dump(Formatter *f) const {
 }
 
 void ResizePayload::encode(bufferlist &bl) const {
-  AsyncRequestPayloadBase::encode(bl);
   ::encode(size, bl);
+  AsyncRequestPayloadBase::encode(bl);
   ::encode(allow_shrink, bl);
 }
 
 void ResizePayload::decode(__u8 version, bufferlist::iterator &iter) {
-  AsyncRequestPayloadBase::decode(version, iter);
   ::decode(size, iter);
+  AsyncRequestPayloadBase::decode(version, iter);
 
   if (version >= 4) {
     ::decode(allow_shrink, iter);
@@ -230,24 +187,31 @@ void ResizePayload::dump(Formatter *f) const {
 
 void SnapPayloadBase::encode(bufferlist &bl) const {
   ::encode(snap_name, bl);
+  ::encode(cls::rbd::SnapshotNamespaceOnDisk(snap_namespace), bl);
 }
 
 void SnapPayloadBase::decode(__u8 version, bufferlist::iterator &iter) {
   ::decode(snap_name, iter);
+  if (version >= 6) {
+    cls::rbd::SnapshotNamespaceOnDisk sn;
+    ::decode(sn, iter);
+    snap_namespace = sn.snapshot_namespace;
+  }
 }
 
 void SnapPayloadBase::dump(Formatter *f) const {
   f->dump_string("snap_name", snap_name);
+  cls::rbd::SnapshotNamespaceOnDisk sn(snap_namespace);
+  sn.dump(f);
 }
 
 void SnapCreatePayload::encode(bufferlist &bl) const {
   SnapPayloadBase::encode(bl);
-  ::encode(cls::rbd::SnapshotNamespaceOnDisk(snap_namespace), bl);
 }
 
 void SnapCreatePayload::decode(__u8 version, bufferlist::iterator &iter) {
   SnapPayloadBase::decode(version, iter);
-  if (version >= 5) {
+  if (version == 5) {
     cls::rbd::SnapshotNamespaceOnDisk sn;
     ::decode(sn, iter);
     snap_namespace = sn.snapshot_namespace;
@@ -256,8 +220,6 @@ void SnapCreatePayload::decode(__u8 version, bufferlist::iterator &iter) {
 
 void SnapCreatePayload::dump(Formatter *f) const {
   SnapPayloadBase::dump(f);
-  cls::rbd::SnapshotNamespaceOnDisk sn(snap_namespace);
-  sn.dump(f);
 }
 
 void SnapRenamePayload::encode(bufferlist &bl) const {
@@ -317,8 +279,8 @@ bool NotifyMessage::check_for_refresh() const {
 }
 
 void NotifyMessage::encode(bufferlist& bl) const {
-  ENCODE_START(5, 1, bl);
-  boost::apply_visitor(EncodePayloadVisitor(bl), payload);
+  ENCODE_START(6, 1, bl);
+  boost::apply_visitor(watcher::util::EncodePayloadVisitor(bl), payload);
   ENCODE_FINISH(bl);
 }
 
@@ -383,7 +345,7 @@ void NotifyMessage::decode(bufferlist::iterator& iter) {
     break;
   }
 
-  apply_visitor(DecodePayloadVisitor(struct_v, iter), payload);
+  apply_visitor(watcher::util::DecodePayloadVisitor(struct_v, iter), payload);
   DECODE_FINISH(iter);
 }
 
@@ -400,11 +362,11 @@ void NotifyMessage::generate_test_instances(std::list<NotifyMessage *> &o) {
   o.push_back(new NotifyMessage(AsyncCompletePayload(AsyncRequestId(ClientId(0, 1), 2), 3)));
   o.push_back(new NotifyMessage(FlattenPayload(AsyncRequestId(ClientId(0, 1), 2))));
   o.push_back(new NotifyMessage(ResizePayload(123, true, AsyncRequestId(ClientId(0, 1), 2))));
-  o.push_back(new NotifyMessage(SnapCreatePayload("foo",
-						  cls::rbd::UserSnapshotNamespace())));
-  o.push_back(new NotifyMessage(SnapRemovePayload("foo")));
-  o.push_back(new NotifyMessage(SnapProtectPayload("foo")));
-  o.push_back(new NotifyMessage(SnapUnprotectPayload("foo")));
+  o.push_back(new NotifyMessage(SnapCreatePayload(cls::rbd::UserSnapshotNamespace(),
+						  "foo")));
+  o.push_back(new NotifyMessage(SnapRemovePayload(cls::rbd::UserSnapshotNamespace(), "foo")));
+  o.push_back(new NotifyMessage(SnapProtectPayload(cls::rbd::UserSnapshotNamespace(), "foo")));
+  o.push_back(new NotifyMessage(SnapUnprotectPayload(cls::rbd::UserSnapshotNamespace(), "foo")));
   o.push_back(new NotifyMessage(RebuildObjectMapPayload(AsyncRequestId(ClientId(0, 1), 2))));
   o.push_back(new NotifyMessage(RenamePayload("foo")));
   o.push_back(new NotifyMessage(UpdateFeaturesPayload(1, true)));
@@ -490,12 +452,6 @@ std::ostream &operator<<(std::ostream &out,
     out << "Unknown (" << static_cast<uint32_t>(op) << ")";
     break;
   }
-  return out;
-}
-
-std::ostream &operator<<(std::ostream &out,
-                         const librbd::watch_notify::ClientId &client_id) {
-  out << "[" << client_id.gid << "," << client_id.handle << "]";
   return out;
 }
 

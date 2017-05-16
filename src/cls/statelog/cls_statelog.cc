@@ -19,12 +19,6 @@
 CLS_VER(1,0)
 CLS_NAME(statelog)
 
-cls_handle_t h_class;
-cls_method_handle_t h_statelog_add;
-cls_method_handle_t h_statelog_list;
-cls_method_handle_t h_statelog_remove;
-cls_method_handle_t h_statelog_check_state;
-
 static string statelog_index_by_client_prefix = "1_";
 static string statelog_index_by_object_prefix = "2_";
 
@@ -279,19 +273,10 @@ static int cls_statelog_check_state(cls_method_context_t hctx, bufferlist *in, b
     return -EINVAL;
   }
 
-  string obj_index;
-  get_index_by_object(op.object, op.op_id, obj_index);
-
-  bufferlist bl;
-  int rc = cls_cxx_map_get_val(hctx, obj_index, &bl);
-  if (rc < 0) {
-    CLS_LOG(0, "could not find entry %s", obj_index.c_str());
-    return rc;
-  }
 
   cls_statelog_entry entry;
 
-  rc = get_existing_entry(hctx, op.client_id, op.op_id, op.object, entry);
+  int rc = get_existing_entry(hctx, op.client_id, op.op_id, op.object, entry);
   if (rc < 0)
     return rc;
 
@@ -301,9 +286,15 @@ static int cls_statelog_check_state(cls_method_context_t hctx, bufferlist *in, b
   return 0;
 }
 
-void __cls_init()
+CLS_INIT(statelog)
 {
   CLS_LOG(1, "Loaded log class!");
+
+  cls_handle_t h_class;
+  cls_method_handle_t h_statelog_add;
+  cls_method_handle_t h_statelog_list;
+  cls_method_handle_t h_statelog_remove;
+  cls_method_handle_t h_statelog_check_state;
 
   cls_register("statelog", &h_class);
 

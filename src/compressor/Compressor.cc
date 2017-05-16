@@ -12,16 +12,18 @@
  *
  */
 
+#include <random>
 #include "Compressor.h"
 #include "CompressionPlugin.h"
 #include "common/dout.h"
 
 const char * Compressor::get_comp_alg_name(int a) {
   switch (a) {
-    case COMP_ALG_NONE: return "none";
-    case COMP_ALG_SNAPPY: return "snappy";
-    case COMP_ALG_ZLIB: return "zlib";
-    default: return "???";
+  case COMP_ALG_NONE: return "none";
+  case COMP_ALG_SNAPPY: return "snappy";
+  case COMP_ALG_ZLIB: return "zlib";
+  case COMP_ALG_ZSTD: return "zstd";
+  default: return "???";
   }
 }
 
@@ -30,6 +32,8 @@ boost::optional<Compressor::CompressionAlgorithm> Compressor::get_comp_alg_type(
     return COMP_ALG_SNAPPY;
   if (s == "zlib")
     return COMP_ALG_ZLIB;
+  if (s == "zstd")
+    return COMP_ALG_ZSTD;
   if (s == "")
     return COMP_ALG_NONE;
 
@@ -59,6 +63,24 @@ boost::optional<Compressor::CompressionMode> Compressor::get_comp_mode_type(cons
 
 CompressorRef Compressor::create(CephContext *cct, const std::string &type)
 {
+  // support "random" for teuthology testing
+  if (type == "random") {
+    static std::random_device seed;
+    static std::default_random_engine engine(seed());
+    static Spinlock mutex;
+
+    int alg = COMP_ALG_NONE;
+    std::uniform_int_distribution<> dist(0, COMP_ALG_LAST - 1);
+    {
+      std::lock_guard<Spinlock> lock(mutex);
+      alg = dist(engine);
+    }
+    if (alg == COMP_ALG_NONE) {
+      return nullptr;
+    }
+    return create(cct, alg);
+  }
+
   CompressorRef cs_impl = NULL;
   std::stringstream ss;
   PluginRegistry *reg = cct->get_plugin_registry();

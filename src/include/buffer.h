@@ -17,6 +17,7 @@
 #if defined(__linux__) || defined(__FreeBSD__)
 #include <stdlib.h>
 #endif
+#include <limits.h>
 
 #ifndef _XOPEN_SOURCE
 # define _XOPEN_SOURCE 600
@@ -77,19 +78,19 @@ namespace buffer CEPH_BUFFER_API {
    */
 
   struct error : public std::exception{
-    const char *what() const throw ();
+    const char *what() const throw () override;
   };
   struct bad_alloc : public error {
-    const char *what() const throw ();
+    const char *what() const throw () override;
   };
   struct end_of_buffer : public error {
-    const char *what() const throw ();
+    const char *what() const throw () override;
   };
   struct malformed_input : public error {
     explicit malformed_input(const std::string& w) {
       snprintf(buf, sizeof(buf), "buffer::malformed_input: %s", w.c_str());
     }
-    const char *what() const throw ();
+    const char *what() const throw () override;
   private:
     char buf[256];
   };
@@ -115,6 +116,8 @@ namespace buffer CEPH_BUFFER_API {
   int get_cached_crc();
   /// count of cached crc hits (mismatching input, required adjustment)
   int get_cached_crc_adjusted();
+  /// count of crc cache misses
+  int get_missed_crc();
   /// enable/disable tracking of cached crcs
   void track_cached_crc(bool b);
 
@@ -155,7 +158,6 @@ namespace buffer CEPH_BUFFER_API {
   raw* create_page_aligned(unsigned len);
   raw* create_zero_copy(unsigned len, int fd, int64_t *offset);
   raw* create_unshareable(unsigned len);
-  raw* create_dummy();
   raw* create_static(unsigned len, char *buf);
   raw* claim_buffer(unsigned len, char *buf, deleter del);
 
@@ -391,8 +393,8 @@ namespace buffer CEPH_BUFFER_API {
 	//return off == bl->length();
       }
 
-      void advance(ssize_t o);
-      void seek(size_t o);
+      void advance(int o);
+      void seek(unsigned o);
       char operator*() const;
       iterator_impl& operator++();
       ptr get_current_ptr() const;
@@ -402,6 +404,8 @@ namespace buffer CEPH_BUFFER_API {
       // copy data out.
       // note that these all _append_ to dest!
       void copy(unsigned len, char *dest);
+      // deprecated, use copy_deep()
+      void copy(unsigned len, ptr &dest) __attribute__((deprecated));
       void copy_deep(unsigned len, ptr &dest);
       void copy_shallow(unsigned len, ptr &dest);
       void copy(unsigned len, list &dest);
@@ -435,14 +439,16 @@ namespace buffer CEPH_BUFFER_API {
       iterator(bl_t *l, unsigned o=0);
       iterator(bl_t *l, unsigned o, list_iter_t ip, unsigned po);
 
-      void advance(ssize_t o);
-      void seek(size_t o);
+      void advance(int o);
+      void seek(unsigned o);
       char operator*();
       iterator& operator++();
       ptr get_current_ptr();
 
       // copy data out
       void copy(unsigned len, char *dest);
+      // deprecated, use copy_deep()
+      void copy(unsigned len, ptr &dest) __attribute__((deprecated));
       void copy_deep(unsigned len, ptr &dest);
       void copy_shallow(unsigned len, ptr &dest);
       void copy(unsigned len, list &dest);
@@ -832,6 +838,7 @@ namespace buffer CEPH_BUFFER_API {
     void append(const list& bl);
     void append(std::istream& in);
     void append_zero(unsigned len);
+    void prepend_zero(unsigned len);
     
     /*
      * get a char
@@ -863,7 +870,17 @@ namespace buffer CEPH_BUFFER_API {
     int write_fd(int fd) const;
     int write_fd(int fd, uint64_t offset) const;
     int write_fd_zero_copy(int fd) const;
-    void prepare_iov(std::vector<iovec> *piov) const;
+    template<typename VectorT>
+    void prepare_iov(VectorT *piov) const {
+      assert(_buffers.size() <= IOV_MAX);
+      piov->resize(_buffers.size());
+      unsigned n = 0;
+      for (auto& p : _buffers) {
+	(*piov)[n].iov_base = (void *)p.c_str();
+	(*piov)[n].iov_len = p.length();
+	++n;
+      }
+    }
     uint32_t crc32c(uint32_t crc) const;
     void invalidate_crc();
   };

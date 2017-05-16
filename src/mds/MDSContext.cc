@@ -18,8 +18,8 @@
 #include "MDSContext.h"
 
 #include "common/dout.h"
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
-
 
 void MDSInternalContextBase::complete(int r) {
   MDSRank *mds = get_mds();
@@ -100,6 +100,6 @@ void C_IO_Wrapper::complete(int r)
 MDSRank *MDSInternalContextGather::get_mds()
 {
   derr << "Forbidden call to MDSInternalContextGather::get_mds by " << typeid(*this).name() << dendl;
-  assert(0);
+  ceph_abort();
 }
 

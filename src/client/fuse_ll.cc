@@ -1,4 +1,4 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -7,9 +7,9 @@
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
- * License version 2.1, as published by the Free Software 
+ * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- * 
+ *
  */
 
 #include <sys/file.h>
@@ -37,6 +37,8 @@
 #include "fuse_ll.h"
 #include <fuse.h>
 #include <fuse_lowlevel.h>
+
+#define dout_context g_ceph_context
 
 #define FINO_INO(x) ((x) & ((1ull<<48)-1ull))
 #define FINO_STAG(x) ((x) >> 48)
@@ -608,7 +610,7 @@ static void fuse_ll_flush(fuse_req_t req, fuse_ino_t ino,
 
 #ifdef FUSE_IOCTL_COMPAT
 static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void *arg, struct fuse_file_info *fi,
-                          unsigned flags, const void *in_buf, size_t in_bufsz, size_t out_bufsz)
+			  unsigned flags, const void *in_buf, size_t in_bufsz, size_t out_bufsz)
 {
   CephFuse::Handle *cfuse = fuse_ll_req_prepare(req);
 
@@ -617,7 +619,7 @@ static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void *arg, st
     return;
   }
 
-  switch(cmd) {
+  switch (static_cast<unsigned>(cmd)) {
     case CEPH_IOC_GET_LAYOUT: {
       file_layout_t layout;
       struct ceph_ioctl_layout l;
@@ -931,7 +933,9 @@ static void do_init(void *data, fuse_conn_info *conn)
 
   if (cfuse->fd_on_success) {
     //cout << "fuse init signaling on fd " << fd_on_success << std::endl;
-    uint32_t r = 0;
+    // see Preforker::daemonize(), ceph-fuse's parent process expects a `-1`
+    // from a daemonized child process.
+    uint32_t r = -1;
     int err = safe_write(cfuse->fd_on_success, &r, sizeof(r));
     if (err) {
       derr << "fuse_ll: do_init: safe_write failed with error "

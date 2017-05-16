@@ -7,13 +7,15 @@ Vcs-Browser: https://github.com/ceph/ceph
 Maintainer: Ceph Maintainers <ceph-maintainers@lists.ceph.com>
 Uploaders: Ken Dreyer <kdreyer@redhat.com>,
            Alfredo Deza <adeza@redhat.com>
-Build-Depends: btrfs-tools,
+Build-Depends: bc,
+               btrfs-tools,
 	       cmake,
                cpio,
 	       cryptsetup-bin | cryptsetup,
                cython,
                cython3,
                debhelper (>= 9),
+               dh-exec,
                dh-python,
 	       dh-systemd,
                default-jdk,
@@ -27,19 +29,12 @@ Build-Depends: btrfs-tools,
                libbabeltrace-ctf-dev,
                libbabeltrace-dev,
                libblkid-dev (>= 2.17),
-               libboost-dev (>= 1.42),
-               libboost-program-options-dev (>= 1.42),
-               libboost-system-dev (>= 1.42),
-               libboost-thread-dev (>= 1.42),
-	       libboost-regex-dev,
-	       libboost-random-dev,
-               libboost-iostreams-dev (>= 1.42),
-               libboost-python-dev,
                libcurl4-gnutls-dev,
                libexpat1-dev,
                libfcgi-dev,
                libfuse-dev,
                libgoogle-perftools-dev [i386 amd64 arm64],
+		libibverbs-dev,
                libkeyutils-dev,
                libleveldb-dev,
                libnss3-dev,
@@ -56,6 +51,7 @@ Build-Depends: btrfs-tools,
                python (>= 2.7),
                python-all-dev,
                python-nose,
+	       python-prettytable,
 	       python-setuptools,
                python-sphinx,
                python3-all-dev,
@@ -91,6 +87,7 @@ Depends: binutils,
          gdisk,
          grep,
          logrotate,
+         psmisc,
          ${python:Depends},
          xfsprogs,
          ${misc:Depends},
@@ -113,6 +110,22 @@ Description: common ceph daemon libraries and management tools
  This package contains the libraries and management tools that are common among
  the Ceph server daemons (ceph-mon, ceph-mgr, ceph-osd, ceph-mds). These tools
  are necessary for creating, running, and administering a Ceph storage cluster.
+
+Package: ceph-base-dbg
+Architecture: linux-any
+Section: debug
+Priority: extra
+Depends: ceph-base (= ${binary:Version}), ${misc:Depends}
+Description: debugging symbols for ceph-base
+ Ceph is a massively scalable, open-source, distributed
+ storage system that runs on commodity hardware and delivers object,
+ block and file system storage.
+ .
+ This package contains the libraries and management tools that are common among
+ the Ceph server daemons (ceph-mon, ceph-mgr, ceph-osd, ceph-mds). These tools
+ are necessary for creating, running, and administering a Ceph storage cluster.
+ .
+ This package contains the debugging symbols for ceph-base.
 
 Package: ceph-mds
 Architecture: linux-any
@@ -352,7 +365,8 @@ Depends: librbd1 (= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends},
          python-rbd (= ${binary:Version}),
          python-rgw (= ${binary:Version}),
          ${python:Depends},
-	 python-requests
+	 python-requests,
+	 python-prettytable
 Conflicts: ceph-client-tools
 Replaces: ceph-client-tools,
 	  ceph (<< 10),
@@ -632,7 +646,7 @@ Description: debugging symbols for radosgw
 
 Package: ceph-test
 Architecture: linux-any
-Depends: ceph-common, curl, xml2, xmlstarlet, ${misc:Depends}, ${shlibs:Depends}
+Depends: ceph-common, curl, xmlstarlet, ${misc:Depends}, ${shlibs:Depends}
 Description: Ceph test and benchmarking tools
  This package contains tools for testing and benchmarking Ceph.
 
@@ -641,7 +655,7 @@ Architecture: linux-any
 Section: debug
 Priority: extra
 Depends: ceph-test (= ${binary:Version}), ceph-common (= ${binary:Version}),
-         curl, xml2,
+         curl,
          ${misc:Depends}
 Description: Ceph test and benchmarking tools
  .
@@ -813,3 +827,11 @@ Section: java
 Depends: libcephfs2 (= ${binary:Version}), ${java:Depends},
          ${misc:Depends}, ${shlibs:Depends}
 Description: Java Native Interface library for CephFS Java bindings
+
+Package: rados-objclass-dev
+Architecture: linux-any
+Section: libdevel
+Depends: librados-dev (= ${binary:Version}) ${misc:Depends}
+Description: RADOS object class development kit.
+ .
+ This package contains development files needed for building RADOS object class plugins.

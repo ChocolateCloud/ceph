@@ -50,7 +50,7 @@ static int do_show_status(librados::IoCtx &io_ctx, librbd::Image &image,
     f->open_object_section("status");
 
   if (f) {
-    f->open_object_section("watchers");
+    f->open_array_section("watchers");
     for (std::list<obj_watch_t>::iterator i = watchers.begin(); i != watchers.end(); ++i) {
       f->open_object_section("watcher");
       f->dump_string("address", i->addr);
@@ -106,7 +106,7 @@ int execute(const po::variables_map &vm) {
   librados::Rados rados;
   librados::IoCtx io_ctx;
   librbd::Image image;
-  r = utils::init_and_open_image(pool_name, image_name, "", true, &rados,
+  r = utils::init_and_open_image(pool_name, image_name, "", "", true, &rados,
                                  &io_ctx, &image);
   if (r < 0) {
     return r;

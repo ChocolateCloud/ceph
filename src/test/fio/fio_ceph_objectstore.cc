@@ -23,10 +23,8 @@
 
 #include "include/assert.h" // fio.h clobbers our assert.h
 
-
-// enable boost::intrusive_ptr<CephContext>
-void intrusive_ptr_add_ref(CephContext* cct) { cct->get(); }
-void intrusive_ptr_release(CephContext* cct) { cct->put(); }
+#define dout_context g_ceph_context
+#define dout_subsys ceph_subsys_
 
 namespace {
 
@@ -86,7 +84,13 @@ struct Engine {
     std::lock_guard<std::mutex> l(lock);
     --ref_count;
     if (!ref_count) {
+      ostringstream ostr;
+      Formatter* f = Formatter::create("json-pretty", "json-pretty", "json-pretty");
+      os->dump_perf_counters(f);
+      f->flush(ostr);
+      delete f;
       os->umount();
+      dout(0) << "FIO plugin " << ostr.str() << dendl;
     }
   }
 };
@@ -107,11 +111,10 @@ Engine::Engine(const thread_data* td) : ref_count(0)
     args.emplace_back(td->o.directory);
   }
 
-  global_init(nullptr, args, CEPH_ENTITY_TYPE_OSD, CODE_ENVIRONMENT_UTILITY, 0);
-  common_init_finish(g_ceph_context);
-
   // claim the g_ceph_context reference and release it on destruction
-  cct = boost::intrusive_ptr<CephContext>(g_ceph_context, false);
+  cct = global_init(nullptr, args, CEPH_ENTITY_TYPE_OSD,
+			 CODE_ENVIRONMENT_UTILITY, 0);
+  common_init_finish(g_ceph_context);
 
   // create the ObjectStore
   os.reset(ObjectStore::create(g_ceph_context,
@@ -206,7 +209,7 @@ Job::Job(Engine* engine, const thread_data* td)
   for (uint32_t i = 0; i < td->o.nr_files; i++) {
     auto f = td->files[i];
     f->real_file_size = file_size;
-    f->engine_data = i;
+    f->engine_pos = i;
 
     // associate each object with a collection in a round-robin fashion
     auto& coll = collections[i % collections.size()];
@@ -326,7 +329,7 @@ int fio_ceph_os_queue(thread_data* td, io_u* u)
   fio_ro_check(td, u);
 
   auto job = static_cast<Job*>(td->io_ops_data);
-  auto& object = job->objects[u->file->engine_data];
+  auto& object = job->objects[u->file->engine_pos];
   auto& coll = object.coll;
   auto& os = job->engine->os;
 
@@ -335,12 +338,16 @@ int fio_ceph_os_queue(thread_data* td, io_u* u)
     const int flags = td_rw(td) ? CEPH_OSD_OP_FLAG_FADVISE_WILLNEED : 0;
 
     bufferlist bl;
-    bl.push_back(buffer::create_static(u->xfer_buflen,
-                                       static_cast<char*>(u->xfer_buf)));
+    bl.push_back(buffer::copy(reinterpret_cast<char*>(u->xfer_buf),
+                              u->xfer_buflen ) );
+
     // enqueue a write transaction on the collection's sequencer
     ObjectStore::Transaction t;
     t.write(coll.cid, object.oid, u->offset, u->xfer_buflen, bl, flags);
-    os->queue_transaction(&coll.sequencer, std::move(t), new UnitComplete(u));
+    os->queue_transaction(&coll.sequencer,
+                          std::move(t),
+                          nullptr,
+                          new UnitComplete(u));
     return FIO_Q_QUEUED;
   }
 

@@ -8,7 +8,7 @@
 
 //------------RGWPutObj_Compress---------------
 
-int RGWPutObj_Compress::handle_data(bufferlist& bl, off_t ofs, void **phandle, rgw_obj *pobj, bool *again)
+int RGWPutObj_Compress::handle_data(bufferlist& bl, off_t ofs, void **phandle, rgw_raw_obj *pobj, bool *again)
 {
   bufferlist in_bl;
   if (*again) {
@@ -19,39 +19,26 @@ int RGWPutObj_Compress::handle_data(bufferlist& bl, off_t ofs, void **phandle, r
     if ((ofs > 0 && compressed) ||                                // if previous part was compressed
         (ofs == 0)) {                                             // or it's the first part
       ldout(cct, 10) << "Compression for rgw is enabled, compress part " << bl.length() << dendl;
-      CompressorRef compressor = Compressor::create(cct, cct->_conf->rgw_compression_type);
-      if (!compressor.get()) {
-        if (ofs > 0 && compressed) {
-          lderr(cct) << "Cannot load compressor of type " << cct->_conf->rgw_compression_type
-                              << " for next part, compression process failed" << dendl;
+      int cr = compressor->compress(bl, in_bl);
+      if (cr < 0) {
+        if (ofs > 0) {
+          lderr(cct) << "Compression failed with exit code " << cr
+              << " for next part, compression process failed" << dendl;
           return -EIO;
         }
-        // if compressor isn't available - just do not use it with log warning?
-        ldout(cct, 5) << "Cannot load compressor of type " << cct->_conf->rgw_compression_type 
-                      << " for rgw, check rgw_compression_type config option" << dendl;
         compressed = false;
+        ldout(cct, 5) << "Compression failed with exit code " << cr
+            << " for first part, storing uncompressed" << dendl;
         in_bl.claim(bl);
       } else {
-        int cr = compressor->compress(bl, in_bl);
-        if (cr < 0) {
-          if (ofs > 0 && compressed) {
-            lderr(cct) << "Compression failed with exit code " << cr
-                       << " for next part, compression process failed" << dendl;
-            return -EIO;
-          }
-          ldout(cct, 5) << "Compression failed with exit code " << cr << dendl;
-          compressed = false;
-          in_bl.claim(bl);
-        } else {
-          compressed = true;
+        compressed = true;
     
-          compression_block newbl;
-          int bs = blocks.size();
-          newbl.old_ofs = ofs;
-          newbl.new_ofs = bs > 0 ? blocks[bs-1].len + blocks[bs-1].new_ofs : 0;
-          newbl.len = in_bl.length();
-          blocks.push_back(newbl);
-        }
+        compression_block newbl;
+        int bs = blocks.size();
+        newbl.old_ofs = ofs;
+        newbl.new_ofs = bs > 0 ? blocks[bs-1].len + blocks[bs-1].new_ofs : 0;
+        newbl.len = in_bl.length();
+        blocks.push_back(newbl);
       }
     } else {
       compressed = false;
@@ -77,8 +64,7 @@ RGWGetObj_Decompress::RGWGetObj_Decompress(CephContext* cct_,
 {
   compressor = Compressor::create(cct, cs_info->compression_type);
   if (!compressor.get())
-    lderr(cct) << "Cannot load compressor of type " << cs_info->compression_type 
-                     << " for rgw, check rgw_compression_type config option" << dendl;
+    lderr(cct) << "Cannot load compressor of type " << cs_info->compression_type << dendl;
 }
 
 int RGWGetObj_Decompress::handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len)
@@ -87,8 +73,7 @@ int RGWGetObj_Decompress::handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len
 
   if (!compressor.get()) {
     // if compressor isn't available - error, because cannot return decompressed data?
-    lderr(cct) << "Cannot load compressor of type " << cs_info->compression_type 
-                     << " for rgw, check rgw_compression_type config option" << dendl;
+    lderr(cct) << "Cannot load compressor of type " << cs_info->compression_type << dendl;
     return -EIO;
   }
   bufferlist out_bl, in_bl;
@@ -122,7 +107,7 @@ int RGWGetObj_Decompress::handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len
       tmp_out.copy(0, q_len, out_bl);
     else
       out_bl.append(tmp_out);
-    first_block++;
+    ++first_block;
   }
 
   if (first_data && partial_content && out_bl.length() != 0)
@@ -136,7 +121,7 @@ int RGWGetObj_Decompress::handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len
   return next->handle_data(out_bl, bl_ofs, out_bl.length() - bl_ofs);
 }
 
-void RGWGetObj_Decompress::fixup_range(off_t& ofs, off_t& end)
+int RGWGetObj_Decompress::fixup_range(off_t& ofs, off_t& end)
 {
   if (partial_content) {
     // if user set range, we need to calculate it in decompressed data
@@ -171,5 +156,5 @@ void RGWGetObj_Decompress::fixup_range(off_t& ofs, off_t& end)
   cur_ofs = ofs;
   waiting.clear();
 
-  next->fixup_range(ofs, end);
+  return next->fixup_range(ofs, end);
 }

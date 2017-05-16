@@ -42,6 +42,8 @@
 
 using namespace std;
 
+const static int POLL_TIMEOUT=120000;
+
 struct krbd_ctx {
   CephContext *cct;
   struct udev *udev;
@@ -189,7 +191,7 @@ static int wait_for_udev_add(struct udev_monitor *mon, const char *pool,
 
     fds[0].fd = udev_monitor_get_fd(mon);
     fds[0].events = POLLIN;
-    if (poll(fds, 1, -1) < 0)
+    if (poll(fds, 1, POLL_TIMEOUT) < 0)
       return -errno;
 
     dev = udev_monitor_receive_device(mon);
@@ -473,7 +475,7 @@ static int wait_for_udev_remove(struct udev_monitor *mon, dev_t devno)
 
     fds[0].fd = udev_monitor_get_fd(mon);
     fds[0].events = POLLIN;
-    if (poll(fds, 1, -1) < 0)
+    if (poll(fds, 1, POLL_TIMEOUT) < 0)
       return -errno;
 
     dev = udev_monitor_receive_device(mon);
@@ -552,7 +554,7 @@ static int unmap_image(struct krbd_ctx *ctx, const char *devnode,
                        const char *options)
 {
   struct stat sb;
-  dev_t wholedevno;
+  dev_t wholedevno = 0;
   string id;
   int r;
 
@@ -588,7 +590,7 @@ static int unmap_image(struct krbd_ctx *ctx, const char *pool,
                        const char *image, const char *snap,
                        const char *options)
 {
-  dev_t devno;
+  dev_t devno = 0;
   string id;
   int r;
 

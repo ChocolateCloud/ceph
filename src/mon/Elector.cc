@@ -42,8 +42,7 @@ void Elector::init()
 
 void Elector::shutdown()
 {
-  if (expire_event)
-    mon->timer.cancel_event(expire_event);
+  cancel_timer();
 }
 
 void Elector::bump_epoch(epoch_t e) 
@@ -51,7 +50,7 @@ void Elector::bump_epoch(epoch_t e)
   dout(10) << "bump_epoch " << epoch << " to " << e << dendl;
   assert(epoch <= e);
   epoch = e;
-  MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+  auto t(std::make_shared<MonitorDBStore::Transaction>());
   t->put(Monitor::MONITOR_NAME, "election_epoch", epoch);
   mon->store->apply_transaction(t);
 
@@ -60,7 +59,6 @@ void Elector::bump_epoch(epoch_t e)
   // clear up some state
   electing_me = false;
   acked_me.clear();
-  classic_mons.clear();
 }
 
 
@@ -73,7 +71,6 @@ void Elector::start()
   dout(5) << "start -- can i be leader?" << dendl;
 
   acked_me.clear();
-  classic_mons.clear();
   init();
   
   // start by trying to elect me
@@ -81,12 +78,12 @@ void Elector::start()
     bump_epoch(epoch+1);  // odd == election cycle
   } else {
     // do a trivial db write just to ensure it is writeable.
-    MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+    auto t(std::make_shared<MonitorDBStore::Transaction>());
     t->put(Monitor::MONITOR_NAME, "election_writeable_test", rand());
     int r = mon->store->apply_transaction(t);
     assert(r >= 0);
   }
-  start_stamp = ceph_clock_now(g_ceph_context);
+  start_stamp = ceph_clock_now();
   electing_me = true;
   acked_me[mon->rank].cluster_features = CEPH_FEATURES_ALL;
   acked_me[mon->rank].mon_features = ceph::features::mon::get_supported();
@@ -111,13 +108,12 @@ void Elector::defer(int who)
   if (electing_me) {
     // drop out
     acked_me.clear();
-    classic_mons.clear();
     electing_me = false;
   }
 
   // ack them
   leader_acked = who;
-  ack_stamp = ceph_clock_now(g_ceph_context);
+  ack_stamp = ceph_clock_now();
   MMonElection *m = new MMonElection(MMonElection::OP_ACK, epoch, mon->monmap);
   m->mon_features = ceph::features::mon::get_supported();
   m->sharing_bl = mon->get_supported_commands_bl();
@@ -130,6 +126,8 @@ void Elector::defer(int who)
 
 void Elector::reset_timer(double plus)
 {
+  // set the timer
+  cancel_timer();
   /**
    * This class is used as the callback when the expire_event timer fires up.
    *
@@ -143,17 +141,9 @@ void Elector::reset_timer(double plus)
    * as far as we know, we may even be dead); so, just propose ourselves as the
    * Leader.
    */
-  class C_ElectionExpire : public Context {
-    Elector *elector;
-  public:
-    explicit C_ElectionExpire(Elector *e) : elector(e) { }
-    void finish(int r) {
-      elector->expire();
-    }
-  };
-  // set the timer
-  cancel_timer();
-  expire_event = new C_ElectionExpire(this);
+  expire_event = new C_MonContext(mon, [this](int) {
+      expire();
+    });
   mon->timer.add_event_after(g_conf->mon_election_timeout + plus,
 			     expire_event);
 }
@@ -202,11 +192,6 @@ void Elector::victory()
     mon_features &= p->second.mon_features;
   }
 
-  // decide what command set we're supporting
-  bool use_classic_commands = !classic_mons.empty();
-  // keep a copy to share with the monitor; we clear classic_mons in bump_epoch
-  set<int> copy_classic_mons = classic_mons;
-  
   cancel_timer();
   
   assert(epoch % 2 == 1);  // election
@@ -216,13 +201,8 @@ void Elector::victory()
   const bufferlist *cmds_bl = NULL;
   const MonCommand *cmds;
   int cmdsize;
-  if (use_classic_commands) {
-    mon->get_classic_monitor_commands(&cmds, &cmdsize);
-    cmds_bl = &mon->get_classic_commands_bl();
-  } else {
-    mon->get_locally_supported_monitor_commands(&cmds, &cmdsize);
-    cmds_bl = &mon->get_supported_commands_bl();
-  }
+  mon->get_locally_supported_monitor_commands(&cmds, &cmdsize);
+  cmds_bl = &mon->get_supported_commands_bl();
   
   // tell everyone!
   for (set<int>::iterator p = quorum.begin();
@@ -240,7 +220,7 @@ void Elector::victory()
   // tell monitor
   mon->win_election(epoch, quorum,
                     cluster_features, mon_features,
-                    cmds, cmdsize, &copy_classic_mons);
+                    cmds, cmdsize);
 }
 
 
@@ -351,8 +331,6 @@ void Elector::handle_ack(MonOpRequestRef op)
     // thanks
     acked_me[from].cluster_features = m->get_connection()->get_features();
     acked_me[from].mon_features = m->mon_features;
-    if (!m->sharing_bl.length())
-      classic_mons.insert(from);
     dout(5) << " so far i have {";
     for (map<int, elector_features_t>::const_iterator p = acked_me.begin();
          p != acked_me.end();
@@ -410,18 +388,12 @@ void Elector::handle_victory(MonOpRequestRef op)
   cancel_timer();
 
   // stash leader's commands
-  if (m->sharing_bl.length()) {
-    MonCommand *new_cmds;
-    int cmdsize;
-    bufferlist::iterator bi = m->sharing_bl.begin();
-    MonCommand::decode_array(&new_cmds, &cmdsize, bi);
-    mon->set_leader_supported_commands(new_cmds, cmdsize);
-  } else { // they are a legacy monitor; use known legacy command set
-    const MonCommand *new_cmds;
-    int cmdsize;
-    mon->get_classic_monitor_commands(&new_cmds, &cmdsize);
-    mon->set_leader_supported_commands(new_cmds, cmdsize);
-  }
+  assert(m->sharing_bl.length());
+  MonCommand *new_cmds;
+  int cmdsize;
+  bufferlist::iterator bi = m->sharing_bl.begin();
+  MonCommand::decode_array(&new_cmds, &cmdsize, bi);
+  mon->set_leader_supported_commands(new_cmds, cmdsize);
 }
 
 void Elector::nak_old_peer(MonOpRequestRef op)
@@ -512,7 +484,7 @@ void Elector::dispatch(MonOpRequestRef op)
 		<< ", taking it"
 		<< dendl;
 	mon->monmap->decode(em->monmap_bl);
-        MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+        auto t(std::make_shared<MonitorDBStore::Transaction>());
         t->put("monmap", mon->monmap->epoch, em->monmap_bl);
         t->put("monmap", "last_committed", mon->monmap->epoch);
         mon->store->apply_transaction(t);
@@ -549,13 +521,13 @@ void Elector::dispatch(MonOpRequestRef op)
 	handle_nak(op);
 	return;
       default:
-	assert(0);
+	ceph_abort();
       }
     }
     break;
     
   default: 
-    assert(0);
+    ceph_abort();
   }
 }
 
@@ -563,6 +535,5 @@ void Elector::start_participating()
 {
   if (!participating) {
     participating = true;
-    call_election();
   }
 }

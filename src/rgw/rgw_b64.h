@@ -55,13 +55,14 @@ namespace rgw {
     for (size_t ix = 0; ix < (psize-sref.size()); ++ix)
       outstr.push_back('=');
 
-    return std::move(outstr);
+    return outstr;
   }
 
   inline std::string from_base64(boost::string_ref sref)
   {
     using namespace boost::archive::iterators;
-
+    if (sref.empty())
+      return std::string();
     /* MIME-compliant input will have line-breaks, so we have to
      * filter WS */
     typedef
@@ -78,7 +79,7 @@ namespace rgw {
     std::string outstr(b64_iter(sref.data()),
 		      b64_iter(sref.data() + sref.size()));
 
-    return std::move(outstr);
+    return outstr;
   }
 
 } /* namespace */

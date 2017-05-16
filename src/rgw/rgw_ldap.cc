@@ -35,7 +35,7 @@ std::string parse_rgw_ldap_bindpw(CephContext* ctx)
     }
   }
 
-  return std::move(ldap_bindpw);
+  return ldap_bindpw;
 }
 
 #if defined(HAVE_OPENLDAP)
@@ -94,6 +94,7 @@ namespace rgw {
 	if (ret != LDAP_SUCCESS) {
 	  ldout(g_ceph_context, 10)
 	    << __func__ << " simple_bind failed uid=" << uid
+	    << "ldap err=" << ret
 	    << dendl;
 	}
 	ldap_memfree(dn);

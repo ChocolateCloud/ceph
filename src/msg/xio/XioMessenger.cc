@@ -52,8 +52,6 @@ static const level_pair LEVELS[] = {
   make_pair("trace", 20)
 };
 
-// maintain our own global context, we can't rely on g_ceph_context
-// for things like librados
 static CephContext *context;
 
 int get_level()
@@ -935,7 +933,10 @@ assert(req->out.pdata_iov.nents || !nbuffers);
      }
     tail->next = NULL;
   }
-  xcon->portal->enqueue(xcon, xmsg);
+  xmsg->trace = m->trace;
+  m->trace.event("xio portal enqueue for send");
+  m->trace.keyval("xio message segments", xmsg->hdr.msg_cnt);
+  xcon->portal->enqueue_for_send(xcon, xmsg);
 
   return code;
 } /* send_message(Message *, Connection *) */

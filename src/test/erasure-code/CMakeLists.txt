@@ -115,6 +115,7 @@ add_ceph_unittest(unittest_erasure_code_plugin_isa ${CMAKE_RUNTIME_OUTPUT_DIRECT
 target_link_libraries(unittest_erasure_code_plugin_isa
   global
   ceph-common
+  crush
   ${CMAKE_DL_LIBS}
   erasure_code
   )
@@ -191,6 +192,22 @@ target_link_libraries(unittest_erasure_code_jerasure
   ceph-common
   ec_jerasure
   )
+
+
+include_directories(${CMAKE_SOURCE_DIR}/src/erasure-code/cc/kodo)
+
+# unittest_erasure_code_cc
+add_executable(unittest_erasure_code_cc
+  TestErasureCodeCC.cc
+  $<TARGET_OBJECTS:unit-main>
+  )
+add_ceph_unittest(unittest_erasure_code_cc ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_erasure_code_cc)
+target_link_libraries(unittest_erasure_code_cc
+  global
+  ceph-common
+  ec_cc
+  )
+set_target_properties(unittest_erasure_code_cc PROPERTIES COMPILE_FLAGS ${UNITTEST_CXX_FLAGS})
 
 include_directories(${CMAKE_SOURCE_DIR}/src/erasure-code/jerasure)
 include_directories(${CMAKE_SOURCE_DIR}/src/erasure-code/shec)
